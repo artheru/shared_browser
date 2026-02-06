@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+client/dist/
+
+# Runtime data
+profiles/
+downloads/
+uploads/
+server/data/logs/
+server/data/users.json
+server/data/browsers.json
+
+# Build artifacts
+*.zip
+*.7z
+version.json
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Screenshots (test artifacts)
+test-*.png
+page-*.png
