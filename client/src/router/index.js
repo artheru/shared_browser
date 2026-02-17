@@ -37,6 +37,28 @@ const routes = [
     name: 'AdminStatus',
     component: () => import('../views/AdminStatus.vue'),
     meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    path: '/admin/calllog',
+    name: 'AdminCalllog',
+    component: () => import('../views/AdminCalllog.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    path: '/admin/report',
+    name: 'AdminReport',
+    component: () => import('../views/AdminReport.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true }
+  },
+  {
+    path: '/tools-help',
+    redirect: '/tools-help/mcp'
+  },
+  {
+    path: '/tools-help/:mode(mcp|ai)',
+    name: 'ToolsHelp',
+    component: () => import('../views/ToolsHelp.vue'),
+    meta: { requiresAuth: true }
   }
 ]
 

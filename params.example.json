@@ -1,0 +1,16 @@
+{
+  "port": 3000,
+  "host": "0.0.0.0",
+  "mcp-debug": false,
+  "mcp": {
+    "enabled": true,
+    "routePrefix": "/api/mcp"
+  },
+  "idleClose": {
+    "enabled": true,
+    "timeoutMs": 1800000
+  },
+  "stream": {
+    "screenshotTimeoutMs": 2500
+  }
+}

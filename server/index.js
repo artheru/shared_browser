@@ -29,10 +29,15 @@ const InputHandler = require('./input-handler');
 const NetworkMonitor = require('./network-monitor');
 const usageTracker = require('./usage-tracker');
 const logger = require('./logger');
+const mcpService = require('./mcp-service');
+const mcpLogger = require('./mcp-logger');
+const { TOOL_DEFINITIONS, normalizeToolAccess } = require('./browser-tools-registry');
+const { isUrlAllowedForUser } = require('./domain-policy');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const wsRuntime = new Map(); // `${browserId}_${userId}` -> ws connection/report stats
 
 // 中间件
 app.use(cors());
@@ -81,8 +86,8 @@ app.get('/api/users', authMiddleware, adminMiddleware, (req, res) => {
 
 app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { username, password, isAdmin } = req.body;
-    const user = await userApi.create(username, password, isAdmin);
+    const { username, password, isAdmin, allowedBrowsers } = req.body;
+    const user = await userApi.create(username, password, isAdmin, allowedBrowsers);
     res.json(user);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -111,7 +116,13 @@ app.delete('/api/users/:id', authMiddleware, adminMiddleware, (req, res) => {
 
 app.get('/api/browsers', authMiddleware, (req, res) => {
   try {
-    const browsers = browserApi.getAll();
+    let browsers = browserApi.getAll();
+    // Non-admin users: filter by their allowedBrowsers list
+    if (!req.user.isAdmin) {
+      const userRecord = userApi.getById(req.user.id);
+      const allowed = userRecord?.allowedBrowsers || [];
+      browsers = browsers.filter(b => allowed.includes(b.id));
+    }
     res.json(browsers);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -123,6 +134,14 @@ app.get('/api/browsers/:id', authMiddleware, (req, res) => {
     const browser = browserApi.getById(req.params.id);
     if (!browser) {
       return res.status(404).json({ error: 'Browser not found' });
+    }
+    // Non-admin users: check access permission
+    if (!req.user.isAdmin) {
+      const userRecord = userApi.getById(req.user.id);
+      const allowed = userRecord?.allowedBrowsers || [];
+      if (!allowed.includes(browser.id)) {
+        return res.status(403).json({ error: 'No access to this browser' });
+      }
     }
     res.json(browser);
   } catch (e) {
@@ -142,8 +161,16 @@ app.post('/api/browsers/:id/verify', authMiddleware, async (req, res) => {
 
 app.post('/api/browsers', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { id, name, url, password } = req.body;
-    const browser = await browserApi.create(id, name, url, password);
+    const { id, name, url, password, mcpEnabled, webApiEnabled, domainRestrictions } = req.body;
+    const browser = await browserApi.create(
+      id,
+      name,
+      url,
+      password,
+      mcpEnabled,
+      webApiEnabled,
+      domainRestrictions
+    );
     res.json(browser);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -179,10 +206,270 @@ app.post('/api/browsers/:id/restart', authMiddleware, adminMiddleware, async (re
   }
 });
 
+function getMcpEndpoint(req, browserId) {
+  const host = req.get('host');
+  const protocol = req.protocol;
+  return `${protocol}://${host}${config.mcp.routePrefix}/${encodeURIComponent(browserId)}`;
+}
+
+function getMcpServerJson(req, browserId) {
+  const endpoint = getMcpEndpoint(req, browserId);
+  return {
+    mcpServers: {
+      [browserId]: {
+        transport: 'http',
+        url: endpoint,
+        headers: {
+          Authorization: 'Bearer <token>'
+        }
+      }
+    }
+  };
+}
+
+app.get('/api/browsers/:id/mcp-endpoint', authMiddleware, (req, res) => {
+  const browser = browserApi.getById(req.params.id);
+  if (!browser) {
+    return res.status(404).json({ error: 'Browser not found' });
+  }
+  res.json({
+    browserId: browser.id,
+    mcpEnabled: !!browser.mcpEnabled,
+    webApiEnabled: !!browser.webApiEnabled,
+    endpoint: getMcpEndpoint(req, browser.id),
+    mcpServerJson: getMcpServerJson(req, browser.id)
+  });
+});
+
+app.get('/api/browser-tools/catalog', authMiddleware, (req, res) => {
+  res.json({
+    tools: TOOL_DEFINITIONS,
+    routePrefix: config.mcp.routePrefix
+  });
+});
+
+app.get('/api/browsers/:id/tools-status', authMiddleware, (req, res) => {
+  const browser = browserApi.getById(req.params.id);
+  if (!browser) {
+    return res.status(404).json({ error: 'Browser not found' });
+  }
+  const toolAccess = normalizeToolAccess(browser.toolAccess);
+  res.json({
+    browserId: browser.id,
+    mcpEnabled: !!browser.mcpEnabled,
+    webApiEnabled: !!browser.webApiEnabled,
+    endpoint: getMcpEndpoint(req, browser.id),
+    mcpServerJson: getMcpServerJson(req, browser.id),
+    tools: TOOL_DEFINITIONS.map((tool) => ({
+      ...tool,
+      access: toolAccess[tool.id]
+    }))
+  });
+});
+
+app.put('/api/browsers/:id/tools-status', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const payload = {
+      mcpEnabled: typeof req.body.mcpEnabled === 'boolean' ? req.body.mcpEnabled : undefined,
+      webApiEnabled: typeof req.body.webApiEnabled === 'boolean' ? req.body.webApiEnabled : undefined,
+      toolAccess: req.body.toolAccess
+    };
+    const browser = await browserApi.update(req.params.id, payload);
+    res.json(browser);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 app.get('/api/status', authMiddleware, adminMiddleware, (req, res) => {
   try {
     const status = browserManager.getStatus();
     res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/stream-health', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    res.json(streamService.getHealthStatus());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/report', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    const now = Date.now();
+    const allBrowsers = browserApi.getAll() || [];
+    const allUsers = userApi.getAll() || [];
+    const userNameMap = new Map(allUsers.map(u => [String(u.id), u.username]));
+    const sessionReport = browserManager.getSessionReport();
+    const runtimeMap = browserManager.getBrowserRuntimeMap();
+    const streamSessions = streamService.getHealthStatus().sessions || [];
+    const streamByKey = new Map(streamSessions.map((s) => [`${s.browserId}_${s.userId}`, s]));
+
+    // Helper: build WS+stream diagnostics for a session item
+    function buildSessionDiagnostics(item) {
+      const stream = streamByKey.get(`${item.browserId}_${item.userId}`) || null;
+      const ws = wsRuntime.get(`${item.browserId}_${item.userId}`) || null;
+      const wsSeenAgeMs = ws?.lastSeenAt ? (now - new Date(ws.lastSeenAt).getTime()) : null;
+      const wsAttached = !!ws;
+      const wsConnected = !!(wsAttached && wsSeenAgeMs !== null && wsSeenAgeMs < 15000);
+      const wsRttMs = Number(ws?.wsRttMs || 0);
+      const wsLastPongAgeMs = ws?.lastPongAt ? (now - new Date(ws.lastPongAt).getTime()) : null;
+      const wsHealthy = !!(wsConnected && wsLastPongAgeMs !== null && wsLastPongAgeMs < 15000);
+      const streamRunning = !!stream?.running;
+      const gatewayToChromeOk = !!(wsHealthy && streamRunning && item.browserAlive);
+      const feedbackLatencyMs = wsHealthy ? Number(ws?.feedback?.rtt || 0) : 0;
+      const endpointStatusReasons = [];
+      if (!wsAttached) endpointStatusReasons.push('ws_not_attached');
+      if (wsAttached && !wsConnected) endpointStatusReasons.push('ws_stale');
+      if (wsConnected && !wsHealthy) endpointStatusReasons.push('ws_unhealthy');
+      if (!streamRunning) endpointStatusReasons.push('stream_stopped');
+      if (!item.browserAlive) endpointStatusReasons.push('browser_dead');
+      return {
+        stream: stream ? {
+          running: !!stream.running,
+          fps: stream.fps || 0,
+          quality: stream.quality || 0,
+          chromeFps: stream.chromeFps || 0,
+          clientRtt: stream.clientRtt || 0,
+          pendingFrames: ws?.feedback?.pendingFrames || 0,
+          bytesSent: stream.bytesSent || 0,
+          avgBandwidthBps: stream.avgBandwidthBps || 0,
+          avgOutputFps: stream.avgOutputFps || 0,
+          consecutiveErrors: stream.consecutiveErrors || 0,
+          totalErrors: stream.totalErrors || 0,
+          captureTimeouts: stream.captureTimeouts || 0,
+          avgCaptureDurationMs: stream.avgCaptureDurationMs || 0,
+          lastCaptureDurationMs: stream.lastCaptureDurationMs || 0,
+          lastSuccessAgeMs: stream.lastSuccessAgeMs || 0,
+          recoveries: stream.recoveries || 0,
+          streamTargetId: stream.streamTargetId || '',
+          streamPageUrl: stream.streamPageUrl || '',
+          framesSent: stream.framesSent || 0
+        } : null,
+        connection: ws ? {
+          endpoint: ws.endpoint,
+          clientAddress: ws.clientAddress,
+          forwardedFor: ws.forwardedFor,
+          userAgent: ws.userAgent,
+          connectedAt: ws.connectedAt,
+          lastSeenAt: ws.lastSeenAt
+        } : null,
+        recentUserCommands: ws?.recentUserCommands || [],
+        recentChromeCommands: ws?.recentChromeCommands || [],
+        endpointStatus: {
+          wsConnected,
+          wsHealthy,
+          wsRttMs,
+          wsLastPongAgeMs,
+          gatewayToChromeOk,
+          streamRunning,
+          speedBps: Number(stream?.avgBandwidthBps || 0),
+          clientRttMs: wsHealthy ? wsRttMs : 0,
+          frameDelayMs: feedbackLatencyMs > 0 ? feedbackLatencyMs : 0,
+          status: gatewayToChromeOk ? 'ok' : (wsConnected ? 'degraded' : 'down'),
+          reasons: endpointStatusReasons,
+          streamTargetId: stream?.streamTargetId || '',
+          streamPageUrl: stream?.streamPageUrl || ''
+        }
+      };
+    }
+
+    // Build per-session diagnostics (backward compat)
+    const sessions = sessionReport.map((item) => {
+      return { ...item, ...buildSessionDiagnostics(item) };
+    });
+
+    const byBrowser = allBrowsers.map((browser) => {
+      const browserSessions = sessions.filter((s) => s.browserId === browser.id);
+      const runtime = runtimeMap.get(browser.id) || { pid: null, alive: false };
+
+      // ===== NEW: Tab info table =====
+      const allTabs = browserManager.getAllTabsForBrowser(browser.id);
+      const tabsEnriched = allTabs.map(tab => {
+        // Find stream info for the tab's owner
+        const ownerStream = streamByKey.get(`${browser.id}_${tab.owner}`) || null;
+        const isStreamingThisTab = ownerStream && tab.isActive && ownerStream.streamTargetId === tab.targetId;
+        return {
+          ...tab,
+          ownerName: userNameMap.get(String(tab.owner)) || tab.owner,
+          chromeFps: (isStreamingThisTab && ownerStream) ? (ownerStream.chromeFps || 0) : null,
+          streamRunning: (isStreamingThisTab && ownerStream) ? !!ownerStream.running : false,
+          // Enrich commandLog with user names
+          commandLog: (tab.commandLog || []).map(cmd => ({
+            ...cmd,
+            whoName: userNameMap.get(String(cmd.who)) || cmd.who
+          }))
+        };
+      });
+
+      // ===== NEW: User list =====
+      const userSessions = browserManager.getUserSessionsForBrowser(browser.id);
+      const usersEnriched = userSessions.map(u => {
+        const wsKey = `${browser.id}_${u.userId}`;
+        const ws = wsRuntime.get(wsKey) || null;
+        const stream = streamByKey.get(wsKey) || null;
+        const wsSeenAgeMs = ws?.lastSeenAt ? (now - new Date(ws.lastSeenAt).getTime()) : null;
+        const wsAttached = !!ws;
+        const wsConnected = !!(wsAttached && wsSeenAgeMs !== null && wsSeenAgeMs < 15000);
+        const wsRttMs = Number(ws?.wsRttMs || 0);
+        const wsLastPongAgeMs = ws?.lastPongAt ? (now - new Date(ws.lastPongAt).getTime()) : null;
+        const wsHealthy = !!(wsConnected && wsLastPongAgeMs !== null && wsLastPongAgeMs < 15000);
+        return {
+          ...u,
+          username: userNameMap.get(String(u.userId)) || u.userId,
+          wsConnected,
+          wsHealthy,
+          wsRttMs,
+          streamRunning: !!stream?.running,
+          chromeFps: stream?.chromeFps || 0,
+          lastSeenAt: ws?.lastSeenAt || null,
+          connectedAt: ws?.connectedAt || null
+        };
+      });
+
+      return {
+        browserId: browser.id,
+        browserName: browser.name,
+        mcpEnabled: !!browser.mcpEnabled,
+        webApiEnabled: !!browser.webApiEnabled,
+        process: {
+          pid: runtime.pid,
+          alive: runtime.alive
+        },
+        mcpEndpoint: getMcpEndpoint(req, browser.id),
+        wsEndpoint: `${req.protocol === 'https' ? 'wss' : 'ws'}://${req.get('host')}/ws`,
+        sessionCount: browserSessions.length,
+        tabCount: browserSessions.reduce((sum, s) => sum + (s.tabCount || 0), 0),
+        tabs: tabsEnriched,
+        users: usersEnriched,
+        sessions: browserSessions
+      };
+    });
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      totalBrowsers: allBrowsers.length,
+      totalSessions: sessions.length,
+      byBrowser
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/stream-recover/:browserId/:userId', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    const { browserId, userId } = req.params;
+    const page = browserManager.getActivePage(browserId, userId);
+    const result = streamService.recoverSession(browserId, userId, page);
+    if (!result.ok) {
+      return res.status(400).json(result);
+    }
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -244,12 +531,344 @@ app.get('/api/logs-browsers', authMiddleware, adminMiddleware, (req, res) => {
   }
 });
 
+// ============== MCP API ==============
+
+app.get('/api/mcp/calls', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 200;
+    const browserId = req.query.browserId || null;
+    const source = req.query.source || null;
+    res.json(mcpLogger.list(limit, browserId, source));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/calllog', authMiddleware, adminMiddleware, (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 200;
+    const browserId = req.query.browserId || null;
+    const source = req.query.source || null;
+    res.json(mcpLogger.list(limit, browserId, source));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/mcp/help', authMiddleware, (req, res) => {
+  const host = req.get('host');
+  const protocol = req.protocol;
+  res.json({
+    title: 'Shared Browser MCP/API Help',
+    routePrefix: config.mcp.routePrefix,
+    browserIdHint: 'Replace :browserId with a real browser id (e.g. mcp-demo, test).',
+    tools: TOOL_DEFINITIONS.map((tool) => ({
+      ...tool,
+      endpointTemplate: `${protocol}://${host}${config.mcp.routePrefix}/:browserId/${tool.mcpPath}`
+    }))
+  });
+});
+
+function ensureMcpAvailable(res) {
+  if (!config.mcp.enabled) {
+    res.status(503).json({ error: 'MCP disabled by server config' });
+    return false;
+  }
+  return true;
+}
+
+function ensureBrowserApiModeEnabled(res, browser) {
+  if (!browser.mcpEnabled && !browser.webApiEnabled) {
+    res.status(403).json({ error: 'MCP/WebAPI disabled for this browser' });
+    return false;
+  }
+  return true;
+}
+
+function ensureToolEnabled(res, browser, toolId) {
+  const access = normalizeToolAccess(browser.toolAccess);
+  const tool = access[toolId];
+  if (!tool || !tool.apiEnabled) {
+    res.status(403).json({ error: `API disabled for tool: ${toolId}` });
+    return false;
+  }
+  return true;
+}
+
+function inferCallSource(req) {
+  const sessionHeader = req.get('mcp-session-id') || req.get('x-mcp-session-id') || req.get('x-mcp-session');
+  const userAgent = String(req.get('user-agent') || '').toLowerCase();
+  if (sessionHeader || userAgent.includes('mcp')) {
+    return 'mcp';
+  }
+  return 'api';
+}
+
+function summarizeToolResponse(tool, data) {
+  if (!data || typeof data !== 'object') return data;
+  switch (tool) {
+    case 'screenshot':
+      return {
+        hasImageBase64: !!data.imageBase64,
+        imageBase64Length: data.imageBase64 ? data.imageBase64.length : 0,
+        width: data.width,
+        height: data.height,
+        format: data.format
+      };
+    case 'dev_html':
+      return {
+        url: data.url,
+        title: data.title,
+        htmlLength: data.html ? data.html.length : 0
+      };
+    case 'dev_console':
+      return {
+        count: Array.isArray(data.entries) ? data.entries.length : 0
+      };
+    default:
+      return data;
+  }
+}
+
+function logToolCallStart(req, browserId, tool) {
+  return {
+    start: Date.now(),
+    entry: {
+      source: inferCallSource(req),
+      method: req.method,
+      path: req.originalUrl,
+      browserId,
+      tool,
+      user: req.user?.username,
+      request: {
+        params: req.params,
+        query: req.query,
+        body: req.body
+      }
+    }
+  };
+}
+
+function logToolCallOk(callCtx, data) {
+  mcpLogger.log({
+    ...callCtx.entry,
+    status: 'ok',
+    durationMs: Date.now() - callCtx.start,
+    response: summarizeToolResponse(callCtx.entry.tool, data)
+  });
+}
+
+function logToolCallError(callCtx, err) {
+  mcpLogger.log({
+    ...callCtx.entry,
+    status: 'error',
+    durationMs: Date.now() - callCtx.start,
+    error: err?.message || String(err),
+    response: {
+      error: err?.message || String(err)
+    }
+  });
+}
+
+app.post(`${config.mcp.routePrefix}/:browserId/screenshot`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'screenshot');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'screenshot')) return;
+
+    const data = await mcpService.screenshot(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/pointer`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'pointer');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'pointer')) return;
+
+    const data = await mcpService.pointerAction(browserId, req.body || {}, req.user.id);
+    if (data && data.end) {
+      browserManager.updateRemoteCursor(browserId, {
+        x: data.end.x,
+        y: data.end.y,
+        button: req.body?.button || 'left',
+        source: 'webapi'
+      }, req.user.id);
+    }
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/input`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'input');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'input')) return;
+
+    const data = await mcpService.inputText(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/downloads`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'downloads');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'downloads')) return;
+
+    const data = await mcpService.listDownloads(browserId);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/downloads/state`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'downloads_state');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'downloads_state')) return;
+
+    const files = fileService.getDownloadedFiles(browserId, req.user.id);
+    const active = fileService.getActiveDownloads(browserId, req.user.id);
+    const data = { files, active };
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/dev/html`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'dev_html');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'dev_html')) return;
+
+    const data = await mcpService.getHtml(browserId, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/dev/console`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'dev_console');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'dev_console')) return;
+
+    const limit = parseInt(req.query.limit, 10) || 200;
+    const data = mcpService.getConsole(browserId, limit);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/dev/eval`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'dev_eval');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'dev_eval')) return;
+
+    const script = String(req.body?.script || '');
+    if (!script) return res.status(400).json({ error: 'script is required' });
+    const data = await mcpService.evalJs(browserId, script, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+if (config.mcp.debugEnabled) {
+  app.get('/mcp-debug/:browserId/screenshot', authMiddleware, async (req, res) => {
+    try {
+      const data = await mcpService.screenshot(req.params.browserId, { fullPage: req.query.fullPage === '1' }, req.user.id);
+      res.json(data);
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+}
+
 // ============== 文件 API ==============
 
 app.get('/api/files/:browserId', authMiddleware, (req, res) => {
   try {
-    const files = fileService.getDownloadedFiles(req.params.browserId, req.user.id);
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    const files = isShared
+      ? fileService.getDownloadedFilesForBrowser(req.params.browserId)
+      : fileService.getDownloadedFiles(req.params.browserId, req.user.id);
     res.json(files);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/files/:browserId/active', authMiddleware, (req, res) => {
+  try {
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    const data = isShared
+      ? fileService.getActiveDownloadsForBrowser(req.params.browserId)
+      : fileService.getActiveDownloads(req.params.browserId, req.user.id);
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -257,11 +876,15 @@ app.get('/api/files/:browserId', authMiddleware, (req, res) => {
 
 app.get('/api/files/:browserId/:filename', authMiddleware, (req, res) => {
   try {
-    const filePath = fileService.getDownloadFilePath(
-      req.params.browserId,
-      req.user.id,
-      req.params.filename
-    );
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    const filePath = isShared
+      ? fileService.getSharedDownloadFilePath(req.params.browserId, req.params.filename)
+      : fileService.getDownloadFilePath(
+        req.params.browserId,
+        req.user.id,
+        req.params.filename
+      );
     res.download(filePath);
   } catch (e) {
     res.status(404).json({ error: e.message });
@@ -316,12 +939,44 @@ app.post('/api/files/:browserId/drop', authMiddleware, upload.array('files', 20)
 
 app.delete('/api/files/:browserId/:filename', authMiddleware, (req, res) => {
   try {
-    fileService.deleteDownloadedFile(
-      req.params.browserId,
-      req.user.id,
-      req.params.filename
-    );
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    if (isShared) {
+      fileService.deleteSharedDownloadedFile(req.params.browserId, req.params.filename);
+    } else {
+      fileService.deleteDownloadedFile(
+        req.params.browserId,
+        req.user.id,
+        req.params.filename
+      );
+    }
     res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.delete('/api/files/:browserId', authMiddleware, (req, res) => {
+  try {
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    if (isShared) {
+      fileService.clearBrowserDownloadDirs(req.params.browserId);
+    } else {
+      fileService.clearDownloadDir(req.params.browserId, req.user.id);
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/files/:browserId/cancel/:guid', authMiddleware, async (req, res) => {
+  try {
+    const browser = browserApi.getById(req.params.browserId);
+    const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+    const result = await fileService.cancelDownload(req.params.browserId, req.user.id, req.params.guid, isShared);
+    res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
@@ -338,12 +993,62 @@ wss.on('connection', async (ws, req) => {
   let streamSession = null;
   let networkMonitor = null;
   let networkStatsTimer = null;
+  let wsPingTimer = null;
+  let streamRecovering = false;
+  let currentWsConnKey = null;
 
   // 安全发送消息
   function wsSend(data) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(data));
     }
+  }
+
+  function touchWsRuntime() {
+    if (!currentWsConnKey || !wsRuntime.has(currentWsConnKey)) return;
+    const item = wsRuntime.get(currentWsConnKey);
+    item.lastSeenAt = new Date().toISOString();
+    wsRuntime.set(currentWsConnKey, item);
+  }
+
+  // Track last N user WS commands and Chrome-dispatched commands
+  // Also log to per-tab command history in browser-manager
+  function logToTab(type, detail) {
+    if (browserId && user) {
+      browserManager.logTabCommand(browserId, user.id, type, detail);
+    }
+  }
+
+  function trackUserCommand(type, detail) {
+    if (!currentWsConnKey || !wsRuntime.has(currentWsConnKey)) return;
+    const item = wsRuntime.get(currentWsConnKey);
+    if (!item.recentUserCommands) item.recentUserCommands = [];
+    item.recentUserCommands.unshift({ type, detail: detail || '', ts: new Date().toISOString() });
+    if (item.recentUserCommands.length > 5) item.recentUserCommands.length = 5;
+  }
+
+  function trackChromeCommand(action, detail) {
+    if (!currentWsConnKey || !wsRuntime.has(currentWsConnKey)) return;
+    const item = wsRuntime.get(currentWsConnKey);
+    if (!item.recentChromeCommands) item.recentChromeCommands = [];
+    item.recentChromeCommands.unshift({ action, detail: detail || '', ts: new Date().toISOString() });
+    if (item.recentChromeCommands.length > 5) item.recentChromeCommands.length = 5;
+  }
+
+  function startWsPingLoop() {
+    if (wsPingTimer) {
+      clearInterval(wsPingTimer);
+      wsPingTimer = null;
+    }
+    const sendPing = () => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      wsSend({
+        type: 'ws_ping',
+        serverTs: Date.now()
+      });
+    };
+    sendPing();
+    wsPingTimer = setInterval(sendPing, 5000);
   }
 
   // 为会话中所有 tab 设置文件处理
@@ -363,6 +1068,7 @@ wss.on('connection', async (ws, req) => {
     try {
       // 尝试解析 JSON（二进制帧不会到这里）
       const message = JSON.parse(data.toString());
+      touchWsRuntime();
 
       switch (message.type) {
         // ==================== 认证 ====================
@@ -396,33 +1102,104 @@ wss.on('connection', async (ws, req) => {
             // 获取会话（含多 Tab）
             const session = await browserManager.getSessionForUser(browserId, user.id);
             const activePage = session.tabs[session.activeIndex].page;
+            currentWsConnKey = `${browserId}_${user.id}`;
+            wsRuntime.set(currentWsConnKey, {
+              endpoint: req?.url || '/ws',
+              clientAddress: req?.socket?.remoteAddress || '',
+              forwardedFor: req?.headers?.['x-forwarded-for'] || '',
+              userAgent: req?.headers?.['user-agent'] || '',
+              connectedAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+              lastPongAt: null,
+              wsRttMs: 0,
+              feedback: { rtt: 0, fps: 0, pendingFrames: 0 }
+            });
+            startWsPingLoop();
 
             // 创建输入处理器
             inputHandler = new InputHandler(activePage);
 
-            // 设置文件服务（所有 tab）
-            await setupFileHandlingForAllTabs(browserId, user.id, session);
-            fileService.setListener(browserId, user.id, (event) => {
-              wsSend(event);
-              // Track download completion
-              if (event.type === 'download_ready' || (event.type === 'download_progress' && event.state === 'completed')) {
-                usageTracker.trackDownload(browserId, user.id);
-              }
-            });
-
             // 创建串流会话
             streamSession = streamService.createSession(browserId, user.id, activePage, ws);
 
+            // 若已有后台常驻串流缓存帧，先秒发一帧，减少首屏等待
+            const warmFrame = streamService.getLatestFrame(browserId);
+            if (warmFrame && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'frame',
+                timestamp: warmFrame.timestamp,
+                quality: warmFrame.quality,
+                size: warmFrame.size
+              }));
+              ws.send(warmFrame.buffer);
+            }
+
             // 设置串流死亡回调
-            streamSession.onStreamDied = (reason, detail) => {
-              logger.warn(browserId, `Stream died: ${reason} - ${detail}`);
+            streamSession.onStreamDied = (reason, detail, diagnostics = {}) => {
+              logger.warn(browserId, `Stream died: ${reason}`, {
+                detail,
+                userId: user?.id,
+                diagnostics
+              });
               wsSend({
                 type: 'stream_error',
                 reason,
-                message: reason === 'page_closed' ? 'Page closed' :
-                         reason === 'browser_disconnected' ? 'Browser disconnected, auto-restarting...' :
-                         'Stream encountered a critical error'
+                detail,
+                diagnostics,
+                message: reason === 'page_closed'
+                  ? `Page closed: ${detail || 'unknown'}`
+                  : reason === 'browser_disconnected'
+                    ? `Browser disconnected: ${detail || 'unknown'}`
+                    : `Stream critical error (${reason}): ${detail || 'unknown'}`
               });
+
+              if (!browserId || !user) return;
+              if (reason !== 'too_many_errors' && reason !== 'page_closed' && reason !== 'browser_disconnected') return;
+              if (streamRecovering) return;
+              streamRecovering = true;
+              const baseDelayMs = 350;
+              const maxDelayMs = 5000;
+              const getRetryDelay = (attempt) => Math.min(
+                Math.floor(baseDelayMs * Math.pow(1.5, Math.max(0, attempt - 1))),
+                maxDelayMs
+              );
+              const attemptRecover = async (attempt = 1) => {
+                try {
+                  if (ws.readyState !== WebSocket.OPEN) {
+                    streamRecovering = false;
+                    return;
+                  }
+                  let activePage = null;
+                  try {
+                    activePage = await browserManager.getPageForUser(browserId, user.id);
+                  } catch (_) {
+                    activePage = browserManager.getActivePage(browserId, user.id);
+                  }
+                  const result = streamService.recoverSession(browserId, user.id, activePage);
+                  if (result.ok) {
+                    wsSend({
+                      type: 'stream_recovered',
+                      message: 'Stream auto-recovered'
+                    });
+                    logger.info(browserId, `Stream auto-recovered for user ${user.id} (attempt ${attempt})`);
+                    streamRecovering = false;
+                    return;
+                  }
+                  if (attempt < 8) {
+                    setTimeout(() => { attemptRecover(attempt + 1); }, getRetryDelay(attempt));
+                    return;
+                  }
+                  logger.warn(browserId, `Stream auto-recover failed after retries: ${result.error}`);
+                } catch (recoverErr) {
+                  if (attempt < 8) {
+                    setTimeout(() => { attemptRecover(attempt + 1); }, getRetryDelay(attempt));
+                    return;
+                  }
+                  logger.warn(browserId, `Stream auto-recover exception after retries: ${recoverErr.message}`);
+                }
+                streamRecovering = false;
+              };
+              setTimeout(() => { attemptRecover(1); }, 300);
             };
 
             // 设置 Tab 事件监听
@@ -434,21 +1211,23 @@ wss.on('connection', async (ws, req) => {
               const page = browserManager.getActivePage(browserId, user.id);
               if (page) {
                 updateActivePage(page);
-                // 为新页面设置文件处理
-                await fileService.setupDownloadHandling(page, browserId, user.id);
-                // 重新附加网络监控
+                // 重操作异步化，避免阻塞 tab 切换后的首帧恢复
+                fileService.setupDownloadHandling(page, browserId, user.id)
+                  .catch((e) => logger.warn(browserId, `setupDownloadHandling(tab_switched) failed: ${e.message}`));
                 if (networkMonitor) {
-                  await networkMonitor.attach(page);
+                  networkMonitor.attach(page)
+                    .catch((e) => logger.warn(browserId, `networkMonitor.attach(tab_switched) failed: ${e.message}`));
                 }
               }
             }
 
               // 当新 tab 创建时（tabs_updated），为新 tab 设置文件处理
               if (event.type === 'tabs_updated') {
-                const sess = browserManager.userSessions.get(`${browserId}_${user.id}`);
+                const sess = browserManager.getSession(browserId, user.id);
                 if (sess) {
                   for (const tab of sess.tabs) {
-                    await fileService.setupDownloadHandling(tab.page, browserId, user.id);
+                    fileService.setupDownloadHandling(tab.page, browserId, user.id)
+                      .catch((e) => logger.warn(browserId, `setupDownloadHandling(tabs_updated) failed: ${e.message}`));
                   }
                 }
               }
@@ -460,20 +1239,37 @@ wss.on('connection', async (ws, req) => {
               }
             });
 
-            // Start usage tracking
+            // 启动串流
+            streamSession.start();
             usageTracker.startSession(browserId, user.id);
 
             wsSend({ type: 'connected', browserId });
+            wsSend({ type: 'tabs_updated', ...browserManager.getTabList(browserId, user.id) });
 
-            // 发送初始 tab 列表
-            const tabList = browserManager.getTabList(browserId, user.id);
-            wsSend({ type: 'tabs_updated', ...tabList });
+            // 后台完成重操作，避免阻塞连接首帧
+            (async () => {
+              try {
+                await setupFileHandlingForAllTabs(browserId, user.id, session);
+                fileService.setListener(browserId, user.id, (event) => {
+                  wsSend(event);
+                  if (event.type === 'download_ready' || (event.type === 'download_progress' && event.state === 'completed')) {
+                    usageTracker.trackDownload(browserId, user.id);
+                  }
+                });
+              } catch (e) {
+                logger.warn(browserId, `Failed to setup file handling: ${e.message}`);
+              }
+            })();
 
-            // 启动网络监控
-            networkMonitor = new NetworkMonitor();
-            await networkMonitor.attach(activePage);
+            (async () => {
+              try {
+                networkMonitor = new NetworkMonitor();
+                await networkMonitor.attach(activePage);
+              } catch (e) {
+                logger.warn(browserId, `Failed to start network monitor: ${e.message}`);
+              }
+            })();
 
-            // 定时发送网络统计（每 2 秒）
             networkStatsTimer = setInterval(() => {
               if (ws.readyState === WebSocket.OPEN) {
                 const netStats = networkMonitor ? networkMonitor.getStats() : {};
@@ -490,9 +1286,6 @@ wss.on('connection', async (ws, req) => {
               }
             }, 2000);
 
-            // 启动串流
-            streamSession.start();
-
           } catch (e) {
             logger.error(browserId, `Failed to connect browser: ${e.message}`);
             wsSend({ type: 'error', error: `Failed to connect browser: ${e.message}` });
@@ -503,7 +1296,43 @@ wss.on('connection', async (ws, req) => {
         // ==================== 输入事件 ====================
         case 'input': {
           if (inputHandler) {
+            if (browserId) browserManager.touchBrowser(browserId);
+            const evtType = message.event?.type || 'unknown';
+            // Track user command (skip high-freq mousemove)
+            if (evtType !== 'mousemove') {
+              trackUserCommand('input', `${evtType} x=${message.event?.x||''} y=${message.event?.y||''} key=${message.event?.key||''}`);
+              logToTab('input', `${evtType} x=${message.event?.x||''} y=${message.event?.y||''} key=${message.event?.key||''}`);
+            }
+            if (browserId && user && message.event &&
+              (message.event.type === 'mousedown' || message.event.type === 'mouseup')) {
+              const pageForLog = browserManager.getActivePage(browserId, user.id);
+              logger.info(browserId, `Input ${message.event.type}`, {
+                userId: user.id,
+                x: Number(message.event.x || 0),
+                y: Number(message.event.y || 0),
+                button: message.event.button,
+                pageUrl: pageForLog ? pageForLog.url() : ''
+              });
+            }
             await inputHandler.handleEvent(message.event);
+            // Track Chrome command
+            if (evtType !== 'mousemove') {
+              trackChromeCommand(`input.${evtType}`, `x=${message.event?.x||''} y=${message.event?.y||''} key=${message.event?.key||''}`);
+            }
+            if (browserId && message.event && (
+              message.event.type === 'mousemove' ||
+              message.event.type === 'mousedown' ||
+              message.event.type === 'mouseup'
+            )) {
+              browserManager.updateRemoteCursor(browserId, {
+                x: message.event.x,
+                y: message.event.y,
+                button: typeof message.event.button === 'number'
+                  ? ({ 0: 'left', 1: 'middle', 2: 'right' }[message.event.button] || 'left')
+                  : (message.event.button || 'left'),
+                source: 'ws'
+              }, user.id);
+            }
             // Track usage
             if (browserId && user) {
               const evt = message.event;
@@ -522,19 +1351,92 @@ wss.on('connection', async (ws, req) => {
           if (streamSession) {
             streamSession.updateFeedback(message.data);
           }
+          if (currentWsConnKey && wsRuntime.has(currentWsConnKey)) {
+            const item = wsRuntime.get(currentWsConnKey);
+            item.lastSeenAt = new Date().toISOString();
+            item.feedback = {
+              rtt: Number(message?.data?.rtt || 0),
+              fps: Number(message?.data?.fps || 0),
+              pendingFrames: Number(message?.data?.pendingFrames || 0)
+            };
+            wsRuntime.set(currentWsConnKey, item);
+          }
+          break;
+        }
+
+        case 'stream_recover': {
+          if (browserId && user) {
+            trackUserCommand('stream_recover', `reason=${message?.reason || 'manual'} idleMs=${message?.idleMs || 0}`);
+            const idleMs = Number(message?.idleMs || 0);
+            const reason = String(message?.reason || 'manual');
+            const activePage = browserManager.getActivePage(browserId, user.id);
+            const result = streamService.recoverSession(browserId, user.id, activePage);
+            logger.info(browserId, 'WS stream_recover requested', {
+              userId: user.id,
+              reason,
+              idleMs,
+              ok: !!result.ok,
+              error: result.error || null
+            });
+            if (result.ok) {
+              wsSend({ type: 'stream_recovered', message: 'Stream recovered by watchdog' });
+            } else {
+              wsSend({ type: 'stream_error', reason: 'recover_failed', detail: result.error, message: `Stream recover failed: ${result.error}` });
+            }
+          }
+          break;
+        }
+
+        case 'ws_pong': {
+          if (currentWsConnKey && wsRuntime.has(currentWsConnKey)) {
+            const now = Date.now();
+            const item = wsRuntime.get(currentWsConnKey);
+            const serverTs = Number(message.serverTs || 0);
+            const rtt = serverTs > 0 ? Math.max(0, now - serverTs) : 0;
+            item.lastSeenAt = new Date(now).toISOString();
+            item.lastPongAt = new Date(now).toISOString();
+            item.wsRttMs = rtt;
+            wsRuntime.set(currentWsConnKey, item);
+          }
           break;
         }
 
         // ==================== URL 导航 ====================
         case 'navigate': {
           if (browserId && user) {
+            trackUserCommand('navigate', message.url || '');
+            logToTab('navigate', message.url || '');
+            const startedAt = Date.now();
+            browserManager.touchBrowser(browserId);
+            const browserCfg = browserApi.getById(browserId);
+            const accessCheck = isUrlAllowedForUser(message.url, browserCfg, user);
+            if (!accessCheck.allowed) {
+              wsSend({
+                type: 'domain_blocked',
+                blockedUrl: message.url || '',
+                allowedDomains: browserCfg?.domainRestrictions || []
+              });
+              logger.warn(browserId, `Blocked navigation for non-admin user ${user.id}`, {
+                url: message.url,
+                allowedDomains: browserCfg?.domainRestrictions || []
+              });
+              break;
+            }
+            if (Number.isInteger(message.tabIndex)) {
+              await browserManager.switchTab(browserId, user.id, Number(message.tabIndex));
+            }
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               try {
                 await activePage.goto(message.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                logger.info(browserId, `User ${user.id} navigated to ${message.url}`);
+                trackChromeCommand('page.goto', `${message.url} (${Date.now() - startedAt}ms)`);
+                logger.info(browserId, `User ${user.id} navigated to ${message.url}`, {
+                  elapsedMs: Date.now() - startedAt,
+                  tabIndex: Number.isInteger(message.tabIndex) ? Number(message.tabIndex) : undefined
+                });
                 usageTracker.trackPageView(browserId, user.id);
               } catch (e) {
+                trackChromeCommand('page.goto.FAIL', `${message.url}: ${e.message}`);
                 logger.warn(browserId, `Navigation failed: ${e.message}`);
               }
             }
@@ -545,13 +1447,17 @@ wss.on('connection', async (ws, req) => {
         // ==================== 浏览器导航（前进/后退/刷新/停止） ====================
         case 'go_back': {
           if (browserId && user) {
+            trackUserCommand('go_back', '');
+            logToTab('go_back', '');
+            browserManager.touchBrowser(browserId);
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               try {
                 await activePage.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 });
+                trackChromeCommand('page.goBack', 'ok');
                 usageTracker.trackPageView(browserId, user.id);
               } catch (e) {
-                // 没有可以后退的历史记录
+                trackChromeCommand('page.goBack', 'no history');
               }
             }
           }
@@ -560,13 +1466,17 @@ wss.on('connection', async (ws, req) => {
 
         case 'go_forward': {
           if (browserId && user) {
+            trackUserCommand('go_forward', '');
+            logToTab('go_forward', '');
+            browserManager.touchBrowser(browserId);
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               try {
                 await activePage.goForward({ waitUntil: 'domcontentloaded', timeout: 15000 });
+                trackChromeCommand('page.goForward', 'ok');
                 usageTracker.trackPageView(browserId, user.id);
               } catch (e) {
-                // 没有可以前进的历史记录
+                trackChromeCommand('page.goForward', 'no history');
               }
             }
           }
@@ -575,11 +1485,16 @@ wss.on('connection', async (ws, req) => {
 
         case 'refresh': {
           if (browserId && user) {
+            trackUserCommand('refresh', '');
+            logToTab('refresh', '');
+            browserManager.touchBrowser(browserId);
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               try {
                 await activePage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                trackChromeCommand('page.reload', 'ok');
               } catch (e) {
+                trackChromeCommand('page.reload.FAIL', e.message);
                 logger.warn(browserId, `Refresh failed: ${e.message}`);
               }
             }
@@ -589,6 +1504,8 @@ wss.on('connection', async (ws, req) => {
 
         case 'stop_loading': {
           if (browserId && user) {
+            trackUserCommand('stop_loading', '');
+            logToTab('stop_loading', '');
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               try {
@@ -607,7 +1524,18 @@ wss.on('connection', async (ws, req) => {
         // ==================== Tab 管理 ====================
         case 'tab_list': {
           if (browserId && user) {
+            const reason = String(message.reason || 'unspecified');
+            if (message.refreshMeta === true) {
+              await browserManager.refreshTabMeta(browserId, user.id);
+            }
             const tabList = browserManager.getTabList(browserId, user.id);
+            logger.info(browserId, 'Tab list requested', {
+              userId: user.id,
+              reason,
+              refreshMeta: !!message.refreshMeta,
+              tabCount: (tabList.tabs || []).length,
+              activeIndex: tabList.activeIndex
+            });
             wsSend({ type: 'tabs_updated', ...tabList });
           }
           break;
@@ -615,10 +1543,18 @@ wss.on('connection', async (ws, req) => {
 
         case 'tab_switch': {
           if (browserId && user && message.tabIndex !== undefined) {
+            trackUserCommand('tab_switch', `tabIndex=${message.tabIndex}`);
+            const switchStart = Date.now();
             const page = await browserManager.switchTab(browserId, user.id, message.tabIndex);
             if (page) {
               updateActivePage(page);
-              await fileService.setupDownloadHandling(page, browserId, user.id);
+              wsSend({ type: 'tabs_updated', ...browserManager.getTabList(browserId, user.id) });
+              fileService.setupDownloadHandling(page, browserId, user.id)
+                .catch((e) => logger.warn(browserId, `setupDownloadHandling(tab_switch) failed: ${e.message}`));
+              logger.info(browserId, `User ${user.id} switched tab`, {
+                tabIndex: Number(message.tabIndex),
+                elapsedMs: Date.now() - switchStart
+              });
             }
           }
           break;
@@ -626,12 +1562,37 @@ wss.on('connection', async (ws, req) => {
 
         case 'tab_new': {
           if (browserId && user) {
+            trackUserCommand('tab_new', message.url || 'blank');
+            const createStart = Date.now();
+            const browserCfg = browserApi.getById(browserId);
+            if (message.url) {
+              const accessCheck = isUrlAllowedForUser(message.url, browserCfg, user);
+              if (!accessCheck.allowed) {
+                wsSend({
+                  type: 'domain_blocked',
+                  blockedUrl: message.url,
+                  allowedDomains: browserCfg?.domainRestrictions || []
+                });
+                logger.warn(browserId, `Blocked tab_new for non-admin user ${user.id}`, {
+                  url: message.url,
+                  allowedDomains: browserCfg?.domainRestrictions || []
+                });
+                break;
+              }
+            }
             const page = await browserManager.createNewTab(
               browserId, user.id, message.url || null
             );
             if (page) {
               updateActivePage(page);
-              await fileService.setupDownloadHandling(page, browserId, user.id);
+              fileService.setupDownloadHandling(page, browserId, user.id)
+                .catch((e) => logger.warn(browserId, `setupDownloadHandling(tab_new) failed: ${e.message}`));
+              const tabMeta = browserManager.getTabList(browserId, user.id);
+              logger.info(browserId, `User ${user.id} created tab via WS`, {
+                elapsedMs: Date.now() - createStart,
+                tabCount: (tabMeta.tabs || []).length,
+                activeIndex: tabMeta.activeIndex
+              });
             }
           }
           break;
@@ -639,12 +1600,29 @@ wss.on('connection', async (ws, req) => {
 
         case 'tab_close': {
           if (browserId && user && message.tabIndex !== undefined) {
+            trackUserCommand('tab_close', `tabIndex=${message.tabIndex}`);
+            trackChromeCommand('closeTab', `tabIndex=${message.tabIndex}`);
             await browserManager.closeTab(browserId, user.id, message.tabIndex);
             // 关闭后需要更新到新的活跃页面
             const activePage = browserManager.getActivePage(browserId, user.id);
             if (activePage) {
               updateActivePage(activePage);
             }
+          }
+          break;
+        }
+
+        case 'shutdown_browser': {
+          if (browserId && user) {
+            // For AI-controlled browsers, only admins can shutdown
+            const browserCfg = browserApi.getById(browserId);
+            if (browserCfg && (browserCfg.mcpEnabled || browserCfg.webApiEnabled) && !user.isAdmin) {
+              wsSend({ type: 'error', error: 'Only admin can shutdown AI-controlled browsers' });
+              break;
+            }
+            logger.info(browserId, `User ${user.id} requested shutdown_browser`);
+            const result = await browserManager.shutdownUserSession(browserId, user.id);
+            wsSend({ type: 'shutdown_done', ...result });
           }
           break;
         }
@@ -715,6 +1693,10 @@ wss.on('connection', async (ws, req) => {
       clearInterval(networkStatsTimer);
       networkStatsTimer = null;
     }
+    if (wsPingTimer) {
+      clearInterval(wsPingTimer);
+      wsPingTimer = null;
+    }
 
     if (networkMonitor) {
       await networkMonitor.detach();
@@ -722,13 +1704,23 @@ wss.on('connection', async (ws, req) => {
     }
 
     if (streamSession) {
-      streamSession.stop();
+      if (browserId && user) {
+        streamService.stopSession(browserId, user.id);
+      } else {
+        streamSession.stop();
+      }
     }
 
     if (browserId && user) {
       fileService.removeListener(browserId, user.id);
       browserManager.removeEventListener(browserId, user.id);
       usageTracker.endSession(browserId, user.id);
+      // NOTE: Do NOT shutdown user session here.
+      // Tabs stay alive so the user can return to the browser and resume.
+      // Only the explicit "shutdown_browser" WS message closes all tabs.
+    }
+    if (currentWsConnKey) {
+      wsRuntime.delete(currentWsConnKey);
     }
   });
 
@@ -752,6 +1744,15 @@ server.listen(config.port, config.host, () => {
 
   // 启动浏览器健康检查
   browserManager.startHealthCheck();
+  if (config.browserDaemon && config.browserDaemon.enabled && config.browserDaemon.autoLaunchOnStart) {
+    browserManager.ensureDaemonBrowsers()
+      .then(() => {
+        console.log('[Server] Browser daemon ensured');
+      })
+      .catch((e) => {
+        console.warn('[Server] Browser daemon ensure failed:', e.message);
+      });
+  }
 });
 
 // 优雅退出

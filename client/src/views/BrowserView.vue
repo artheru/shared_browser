@@ -3,50 +3,87 @@
     <!-- 顶部工具栏 -->
     <div class="toolbar" @click.stop @mousedown.stop>
       <div class="nav-buttons">
-        <button class="nav-btn" @click="browserBack" :title="t('browserView.goBack')" :disabled="!isConnected">◀</button>
-        <button class="nav-btn" @click="browserForward" :title="t('browserView.goForward')" :disabled="!isConnected">▶</button>
+        <button class="nav-btn" @click="browserBack" :title="t('browserView.goBack')" :disabled="!isConnected || !canSendUserOperation">◀</button>
+        <button class="nav-btn" @click="browserForward" :title="t('browserView.goForward')" :disabled="!isConnected || !canSendUserOperation">▶</button>
         <button
           class="nav-btn"
           :class="{ 'is-loading': isPageLoading }"
           @click="browserRefresh"
           :title="t('browserView.refresh')"
-          :disabled="!isConnected"
-        >{{ isPageLoading ? '✕' : '↻' }}</button>
+          :disabled="!isConnected || !canSendUserOperation"
+        ><i :class="isPageLoading ? 'fa-solid fa-xmark' : 'fa-solid fa-rotate-right'"></i></button>
       </div>
       <div class="toolbar-center">
-        <div class="url-wrapper" :class="{ loading: isPageLoading }">
+        <div class="url-wrapper" :class="{ 'is-loading-url': isPageLoading }">
           <input
             ref="urlInputRef"
             v-model="urlInput"
             type="text"
             class="url-input"
             :placeholder="t('browserView.urlPlaceholder')"
-            @keyup.enter="navigateToUrl"
+            :disabled="!canSendUserOperation"
+            @keydown.enter.prevent="navigateToUrl"
             @focus="urlFocused = true"
             @blur="urlFocused = false"
           />
           <div v-if="isPageLoading" class="url-loading-bar"></div>
         </div>
-        <button class="btn btn-primary btn-sm" @click="navigateToUrl">{{ t('browserView.go') }}</button>
+        <button
+          class="tool-icon-btn primary"
+          :disabled="!canSendUserOperation"
+          :title="t('browserView.go')"
+          @click="navigateToUrl"
+        ><i class="fa-solid fa-arrow-right"></i></button>
       </div>
       <div class="toolbar-right">
-        <span class="status" :class="{ connected: isConnected }">
-          {{ isConnected ? t('browserView.connected') : t('browserView.connecting') }}
+        <span
+          class="status-dot"
+          :class="{ connected: isConnected }"
+          :title="isConnected ? t('browserView.connected') : t('browserView.connecting')"
+        ></span>
+        <span class="stats compact" :title="t('browserView.statsTooltip')">
+          <i class="fa-regular fa-clock"></i>{{ fps }} | Q{{ quality }} | <i class="fa-solid fa-arrow-down"></i>{{ formatBandwidth(bandwidth) }}
         </span>
-        <span class="stats">
-          {{ fps }} FPS | {{ quality }}% | ↓{{ formatBandwidth(bandwidth) }}
+        <span v-if="isConnected && remoteNetwork.bytesPerSec > 0" class="stats remote-net compact" :title="t('browserView.remoteNetworkActivity')">
+          <i class="fa-solid fa-network-wired"></i><i class="fa-solid fa-arrow-down"></i>{{ formatBandwidth(remoteNetwork.bytesPerSec) }}
         </span>
-        <span v-if="isConnected && remoteNetwork.bytesPerSec > 0" class="stats remote-net" :title="t('browserView.remoteNetworkActivity')">
-          🌐↓{{ formatBandwidth(remoteNetwork.bytesPerSec) }}
-        </span>
-        <span v-if="isConnected && remoteNetwork.activeRequests > 0" class="active-badge" :title="t('browserView.remoteActiveRequests')">
+        <span v-if="isConnected && remoteNetwork.activeRequests > 0" class="active-badge compact" :title="t('browserView.remoteActiveRequests')">
           {{ remoteNetwork.activeRequests }}
         </span>
-        <button class="btn btn-secondary btn-sm" @click="toggleFiles">
-          {{ t('browserView.files', { count: downloadFiles.length }) }}
+        <label v-if="isAiControlledBrowser && authStore.isAdmin" class="ai-override-toggle" :title="t('browserView.overrideAiOperationHint')">
+          <input v-model="overrideAiOperation" type="checkbox" />
+          <span class="ai-toggle-icon"><i :class="overrideAiOperation ? 'fa-solid fa-gamepad' : 'fa-solid fa-robot'"></i></span>
+        </label>
+        <span
+          v-if="isAiControlledBrowser && !overrideAiOperation"
+          class="ai-passive-icon"
+          :title="t('browserView.aiReadOnlyMode')"
+        ><i class="fa-solid fa-ban"></i></span>
+        <button class="tool-icon-btn files-btn" :class="{ 'has-badge': hasFilesBadge }" @click="toggleFiles" :title="tr('browserView.files', 'Files', { count: filesDisplayCount })">
+          <i class="fa-solid fa-folder"></i>
+          <span class="files-count">{{ filesDisplayCount }}</span>
+          <span v-if="hasFilesBadge" class="files-badge-dot"></span>
         </button>
-        <button class="btn btn-exit btn-sm" @click="goBackToList" :title="t('browserView.exitBrowser')">
-          {{ t('browserView.exitBrowser') }}
+        <span v-if="activeDownloads.length > 0" class="download-live-indicator compact" :title="t('browserView.downloadingHint')">
+          <i class="fa-solid fa-download"></i>{{ activeDownloads.length }}
+        </span>
+        <button class="tool-icon-btn" @click="$router.push('/tools-help')" :title="t('common.help')">
+          <i class="fa-solid fa-circle-question"></i>
+        </button>
+        <button
+          v-if="isTouchDevice"
+          class="tool-icon-btn mobile-kb-btn"
+          :disabled="!isConnected || !canSendUserOperation"
+          :title="tr('browserView.showMobileKeyboard', 'Keyboard')"
+          @click="openMobileKeyboard"
+        >
+          <i class="fa-solid fa-keyboard"></i>
+        </button>
+        <button class="tool-icon-btn" @click="goBackToList" :title="tr('browserView.backToSelection', 'Back')">
+          <i class="fa-solid fa-house"></i>
+        </button>
+        <button v-if="!isAiControlledBrowser || authStore.isAdmin" class="tool-icon-btn danger" @click="shutdownBrowser" :title="tr('browserView.shutdownBrowser', 'Shutdown')">
+          <i class="fa-solid fa-power-off"></i>
         </button>
       </div>
     </div>
@@ -56,11 +93,12 @@
       <div class="tab-list" ref="tabListRef">
         <div
           v-for="tab in tabs"
-          :key="tab.index"
+          :key="tab.tab_identifier || tab.tabIdentifier || tab.index"
           class="tab-item"
           :class="{
             active: tab.index === activeTabIndex,
-            'has-dialog': tab.hasDialog
+            'has-dialog': tab.hasDialog,
+            'not-ready': tab.isReady === false
           }"
           @mousedown.stop="switchTab(tab.index)"
         >
@@ -68,20 +106,32 @@
             {{ tab.title || 'New Tab' }}
           </span>
           <span
+            v-if="tab.isReady === false"
+            class="tab-ready-indicator"
+            :title="t('browserView.tabNotReady')"
+          ><i class="fa-solid fa-circle"></i></span>
+          <span
             v-if="tab.hasDialog"
             class="tab-dialog-indicator"
             @click.stop="switchTab(tab.index)"
             :title="t('browserView.tabHasDialog')"
-          >⚠</span>
+          ><i class="fa-solid fa-triangle-exclamation"></i></span>
           <button
             class="tab-close"
             @mousedown.stop
             @click.stop="closeTab(tab.index)"
+            :disabled="!canSendUserOperation"
             :title="t('browserView.closeTab')"
-          >&times;</button>
+          ><i class="fa-solid fa-xmark"></i></button>
         </div>
+        <button
+          class="tab-new-btn inline"
+          :class="{ blocked: !canCreateTab || !canSendUserOperation }"
+          :disabled="!canCreateTab || !canSendUserOperation"
+          @click="createNewTab"
+          :title="canSendUserOperation ? (canCreateTab ? t('browserView.newTab') : t('browserView.newTabBlocked')) : t('browserView.aiReadOnlyMode')"
+        ><i class="fa-solid fa-plus"></i></button>
       </div>
-      <button class="tab-new-btn" @click="createNewTab" :title="t('browserView.newTab')">+</button>
     </div>
 
     <!-- 串流画面容器 -->
@@ -93,6 +143,7 @@
       @mouseup="handleMouseUp"
       @mousemove="handleMouseMove"
       @wheel="handleWheel"
+      @auxclick.prevent="handleAuxClick"
       @contextmenu.prevent="handleContextMenu"
       @dblclick="handleDoubleClick"
       @dragover.prevent="handleDragOver"
@@ -106,6 +157,18 @@
         alt="Browser Stream"
         draggable="false"
       />
+      <div v-if="showBlankHint" class="blank-hint-overlay">
+        <div class="blank-hint-card">
+          <div class="blank-hint-title">{{ t('browserView.blankPageTitle') }}</div>
+          <div class="blank-hint-sub">{{ t('browserView.blankPageTip') }}</div>
+          <div class="blank-hint-url">{{ currentTabUrl || 'about:blank' }}</div>
+        </div>
+      </div>
+      <div
+        class="remote-cursor"
+        :class="{ pressing: remoteCursor.button !== 'none' }"
+        :style="remoteCursorStyle"
+      ></div>
       <div v-if="!isConnected && !streamError" class="connecting-overlay">
         <div class="connecting-spinner"></div>
         <p>{{ t('browserView.connectingToBrowser') }}</p>
@@ -114,7 +177,7 @@
       <!-- Error overlay -->
       <div v-if="streamError" class="error-overlay">
         <div class="error-content">
-          <span class="error-icon">⚠️</span>
+          <span class="error-icon"><i class="fa-solid fa-triangle-exclamation"></i></span>
           <p class="error-message">{{ streamError }}</p>
           <button class="btn btn-primary btn-sm" @click="retryConnect">
             {{ t('browserView.reconnect') }}
@@ -161,25 +224,60 @@
       </div>
     </div>
 
+    <!-- WS Debug panel removed -->
+
     <!-- Files panel -->
     <div v-if="showFiles" class="files-panel">
       <div class="files-header">
         <h3>{{ t('browserView.downloadedFiles') }}</h3>
-        <button class="modal-close" @click="showFiles = false">&times;</button>
+        <div class="files-head-actions">
+          <button class="btn btn-danger btn-sm" @click="removeAllFiles" :disabled="downloadFiles.length === 0">
+            {{ tr('browserView.removeAll', 'Delete All') }}
+          </button>
+          <button class="modal-close" @click="showFiles = false">&times;</button>
+        </div>
       </div>
+      <div v-if="downloadNotice" class="download-notice">{{ downloadNotice }}</div>
       <div class="files-list">
-        <div v-if="downloadFiles.length === 0" class="empty-files">
+        <div v-for="active in activeDownloads" :key="active.guid" class="file-item downloading">
+          <div class="file-left">
+            <div class="file-name-row">
+              <span class="file-status spinner" :title="t('browserView.downloadingUnknown')"></span>
+              <span class="file-name">{{ active.filename || t('browserView.downloadingUnknown') }}</span>
+            </div>
+            <div class="file-meta">
+              <span>{{ formatSize(active.receivedBytes || 0) }} / {{ active.totalBytes ? formatSize(active.totalBytes) : '?' }}</span>
+              <span>{{ active.progress }}%</span>
+            </div>
+            <div class="file-progress-wrap">
+              <div class="file-progress-bar" :style="{ width: active.progress + '%' }"></div>
+            </div>
+          </div>
+          <div class="file-actions vertical">
+            <button class="icon-btn cancel" :title="t('browserView.cancelDownload')" @click="cancelDownload(active.guid)">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+        </div>
+        <div v-if="downloadFiles.length === 0 && activeDownloads.length === 0" class="empty-files">
           {{ t('browserView.noFiles') }}
         </div>
         <div v-for="file in downloadFiles" :key="file.name" class="file-item">
-          <span class="file-name">{{ file.name }}</span>
-          <span class="file-size">{{ formatSize(file.size) }}</span>
-          <div class="file-actions">
-            <a :href="getDownloadUrl(file.name)" class="btn btn-primary btn-sm" download>
-              {{ t('common.download') }}
+          <div class="file-left">
+            <div class="file-name-row">
+              <span class="file-name">{{ file.name }}</span>
+            </div>
+            <div class="file-meta">
+              <span class="file-done-meta">✓ {{ formatFileTime(file.mtime) }}</span>
+              <span>{{ formatSize(file.size) }}</span>
+            </div>
+          </div>
+          <div class="file-actions vertical">
+            <a :href="getDownloadUrl(file.name)" class="icon-btn download" :title="t('common.download')" download>
+              <i class="fa-solid fa-download"></i>
             </a>
-            <button class="btn btn-danger btn-sm" @click="deleteFile(file.name)">
-              {{ t('common.delete') }}
+            <button class="icon-btn delete" :title="t('common.delete')" @click="deleteFile(file.name)">
+              <i class="fa-solid fa-trash"></i>
             </button>
           </div>
         </div>
@@ -210,6 +308,16 @@
         </div>
       </div>
     </div>
+    <textarea
+      ref="mobileKeyboardInputRef"
+      class="mobile-keyboard-bridge"
+      autocapitalize="off"
+      autocomplete="off"
+      autocorrect="off"
+      spellcheck="false"
+      @input="handleMobileKeyboardInput"
+      @keydown="handleMobileKeyboardKeyDown"
+    ></textarea>
   </div>
 </template>
 
@@ -218,21 +326,44 @@ import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../utils/api'
 import { useI18n } from '../i18n'
+import { useAuthStore } from '../stores/auth'
 
 const { t } = useI18n()
+const authStore = useAuthStore()
+const tr = (key, fallback = '', params = undefined) => {
+  const value = t(key, params)
+  if (value === key) return fallback || key
+  return value
+}
 
 const route = useRoute()
 const router = useRouter()
 
 const browserId = computed(() => route.params.id)
+const browserConfig = ref(null)
+const browserConfigLoaded = ref(false)
+const overrideAiOperation = ref(false)
+const isAiControlledBrowser = computed(() => !!(browserConfig.value && (browserConfig.value.mcpEnabled || browserConfig.value.webApiEnabled)))
+const canSendUserOperation = computed(() => {
+  if (!browserConfigLoaded.value) return false
+  if (!browserConfig.value) return true
+  if (!isAiControlledBrowser.value) return true
+  // AI browser: only admin can override, and must toggle the override switch
+  if (!authStore.isAdmin) return false
+  return overrideAiOperation.value
+})
 
 // WebSocket 和连接状态
 let ws = null
+let manualClose = false
 const isConnected = ref(false)
 const streamContainer = ref(null)
 const streamImage = ref(null)
 const urlInputRef = ref(null)
 const urlFocused = ref(false)
+const isTouchDevice = ref(false)
+const mobileKeyboardInputRef = ref(null)
+let mobileKeyboardBuffer = ''
 
 // 串流画面
 const frameSrc = ref('')
@@ -253,6 +384,11 @@ const dialogPromptInput = ref('')
 // 文件相关
 const showFiles = ref(false)
 const downloadFiles = ref([])
+const activeDownloads = ref([])
+const downloadNotice = ref('')
+const hasFilesBadge = ref(false)
+const hasLoadedFilesBaseline = ref(false)
+const filesDisplayCount = computed(() => downloadFiles.value.length + activeDownloads.value.length)
 const showFileChooser = ref(false)
 const fileInput = ref(null)
 const pendingFileUpload = ref(false)
@@ -265,9 +401,20 @@ const isDragging = ref(false)
 
 // 串流/浏览器错误
 const streamError = ref('')
+const remoteCursor = ref({ visible: false, x: 0, y: 0, button: 'none', updatedAt: 0 })
+const remoteCursorStyle = ref({ display: 'none' })
 
 // 页面加载状态
 const isPageLoading = ref(false)
+const creatingTab = ref(false)
+const hasPendingUnreadyTabs = computed(() => tabs.value.some((tab) => tab && tab.isReady === false))
+const canCreateTab = computed(() => isConnected.value && !isPageLoading.value && !creatingTab.value && !hasPendingUnreadyTabs.value)
+const currentTabUrl = computed(() => tabs.value[activeTabIndex.value]?.url || urlInput.value || '')
+const showBlankHint = computed(() => {
+  if (!isConnected.value || streamError.value) return false
+  const url = String(currentTabUrl.value || '')
+  return url === 'about:blank' || url.startsWith('chrome-error://')
+})
 
 // 带宽统计
 const bandwidth = ref(0)      // bytes per second (stream)
@@ -290,9 +437,36 @@ const virtualClipboard = ref('')
 let frameCount = 0
 let lastFpsUpdate = Date.now()
 let pendingFrames = 0
+let lastFrameAt = 0
+let reconnectTimer = null
+let reconnectAttempts = 0
+let streamWatchTimer = null
+let tabSyncTimer = null
+let filesSyncTimer = null
+let wsDebugTimer = null
+let lastMouseMoveSentAt = 0
+let lastFrameHealthLogAt = 0
+let lastTabSnapshot = ''
+let currentFrameServerTs = 0
+let streamLatencyMs = 0
+let noFrameWarnStreak = 0
+let lastRecoverRequestAt = 0
+let streamErrorTimer = null
 
 // 反馈计时器
 let feedbackTimer = null
+
+const wsDebug = ref({
+  readyStateText: 'INIT',
+  lastRxAt: 0,
+  lastTxAt: 0,
+  lastPongAt: 0,
+  lastRxType: '',
+  lastTxType: '',
+  rxCount: 0,
+  txCount: 0,
+  events: []
+})
 
 // 鼠标按下追踪（确保 mouseup 只在 mousedown 来自串流区域时才发送）
 let mouseDownInStream = false
@@ -309,8 +483,49 @@ function focusStream(event) {
 }
 
 function goBackToList() {
+  manualClose = true
   if (ws) {
     ws.close()
+  }
+  router.push('/')
+}
+
+function openMobileKeyboard() {
+  if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
+  const el = mobileKeyboardInputRef.value
+  if (!el) return
+  el.focus()
+  const len = el.value.length
+  el.setSelectionRange(len, len)
+}
+
+function updateTouchMode() {
+  const coarsePointer = !!window.matchMedia?.('(pointer: coarse)').matches
+  isTouchDevice.value = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || coarsePointer || window.innerWidth <= 900
+}
+
+async function loadBrowserConfig() {
+  try {
+    const response = await api.get(`/api/browsers/${browserId.value}`)
+    browserConfig.value = response.data || null
+  } catch (e) {
+    console.error('Failed to load browser config:', e)
+    browserConfig.value = null
+  } finally {
+    browserConfigLoaded.value = true
+  }
+}
+
+function shutdownBrowser() {
+  manualClose = true
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'shutdown_browser' }))
+    setTimeout(() => {
+      ws?.close()
+      router.push('/')
+    }, 250)
+    return
   }
   router.push('/')
 }
@@ -318,6 +533,7 @@ function goBackToList() {
 // ==================== 浏览器导航 ====================
 
 function browserBack() {
+  if (!canSendUserOperation.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     isPageLoading.value = true
     ws.send(JSON.stringify({ type: 'go_back' }))
@@ -325,6 +541,7 @@ function browserBack() {
 }
 
 function browserForward() {
+  if (!canSendUserOperation.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     isPageLoading.value = true
     ws.send(JSON.stringify({ type: 'go_forward' }))
@@ -332,6 +549,7 @@ function browserForward() {
 }
 
 function browserRefresh() {
+  if (!canSendUserOperation.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     if (isPageLoading.value) {
       // 正在加载时点击 → 停止加载
@@ -347,13 +565,35 @@ function browserRefresh() {
 // ==================== WebSocket 连接 ====================
 
 function connect() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws`
 
   ws = new WebSocket(wsUrl)
+  const rawSend = ws.send.bind(ws)
+  ws.send = (payload) => {
+    let type = 'binary'
+    if (typeof payload === 'string') {
+      try {
+        const msg = JSON.parse(payload)
+        type = msg?.type || 'json'
+      } catch (_) {
+        type = 'text'
+      }
+    }
+    pushWsEvent('tx', type)
+    return rawSend(payload)
+  }
 
   ws.onopen = () => {
     console.log('WebSocket connected')
+    pushWsEvent('state', 'open')
+    reconnectAttempts = 0
+    streamError.value = ''
     const token = localStorage.getItem('token')
     ws.send(JSON.stringify({ type: 'auth', token }))
   }
@@ -361,20 +601,37 @@ function connect() {
   ws.onmessage = async (event) => {
     if (typeof event.data === 'string') {
       const message = JSON.parse(event.data)
+      pushWsEvent('rx', message?.type || 'json')
       handleMessage(message)
     } else {
+      pushWsEvent('rx', 'frame-binary')
       handleFrame(event.data)
     }
   }
 
   ws.onclose = () => {
     console.log('WebSocket closed')
+    pushWsEvent('state', 'close')
     isConnected.value = false
+    if (!manualClose) {
+      scheduleReconnect()
+    }
   }
 
   ws.onerror = (error) => {
     console.error('WebSocket error:', error)
+    pushWsEvent('state', 'error', error?.message || '')
   }
+}
+
+function scheduleReconnect() {
+  if (manualClose || reconnectTimer) return
+  reconnectAttempts += 1
+  const delay = Math.min(1000 * Math.pow(2, Math.max(0, reconnectAttempts - 1)), 5000)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connect()
+  }, delay)
 }
 
 function handleMessage(message) {
@@ -385,18 +642,42 @@ function handleMessage(message) {
 
     case 'connected':
       isConnected.value = true
+      lastFrameAt = Date.now()
       startFeedback()
       loadFiles()
+      loadActiveDownloads()
+      sendTabListRequest('connected-init', true)
+      break
+
+    case 'ws_ping':
+      wsDebug.value.lastPongAt = Date.now()
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'ws_pong',
+          serverTs: Number(message.serverTs || 0),
+          clientTs: Date.now()
+        }))
+      }
       break
 
     case 'frame':
       quality.value = message.quality
+      currentFrameServerTs = Number(message.timestamp || 0)
       pendingFrames++
       break
 
+    case 'shutdown_done':
+      if (ws) ws.close()
+      router.push('/')
+      break
+
     case 'tabs_updated':
-      tabs.value = message.tabs || []
-      activeTabIndex.value = message.activeIndex || 0
+      tabs.value = normalizeTabs(message.tabs || [])
+      creatingTab.value = !!message.creatingTab
+      activeTabIndex.value = Math.min(
+        Math.max(0, Number(message.activeIndex || 0)),
+        Math.max(0, tabs.value.length - 1)
+      )
       // 更新 URL 输入框显示当前 tab 的 URL
       if (tabs.value.length > 0 && tabs.value[activeTabIndex.value]) {
         const currentUrl = tabs.value[activeTabIndex.value].url
@@ -406,6 +687,7 @@ function handleMessage(message) {
       }
       // 页面导航完成，清除加载状态
       isPageLoading.value = false
+      logTabSnapshot('tabs_updated')
       break
 
     case 'tab_switched':
@@ -449,17 +731,41 @@ function handleMessage(message) {
     case 'download_ready':
       // Auto-download: trigger browser download immediately
       autoDownloadFile(message.filename)
+      // Keep file list/count in sync even when browser blocks auto-download UI.
+      activeDownloads.value = activeDownloads.value.filter((x) => x.filename !== message.filename)
+      downloadNotice.value = t('browserView.downloadReadyNotice', { filename: message.filename })
+      showFiles.value = true
+      hasFilesBadge.value = true
+      loadActiveDownloads()
+      setTimeout(() => {
+        if (downloadNotice.value === t('browserView.downloadReadyNotice', { filename: message.filename })) {
+          downloadNotice.value = ''
+        }
+      }, 2600)
+      loadFiles()
       break
 
     case 'download_progress':
-      if (message.state === 'completed') {
-        loadFiles()
-      }
+      handleDownloadProgress(message)
       break
 
     case 'stream_error':
-      console.error('Stream error:', message.reason, message.message)
-      streamError.value = message.message || t('browserView.streamError')
+      console.error('[SB][stream] stream_error', {
+        reason: message.reason,
+        message: message.message,
+        detail: message.detail,
+        diagnostics: message.diagnostics
+      })
+      if (message.reason === 'too_many_errors' ||
+          message.reason === 'page_closed' ||
+          message.reason === 'browser_disconnected') {
+        if (streamErrorTimer) clearTimeout(streamErrorTimer)
+        streamErrorTimer = setTimeout(() => {
+          streamError.value = message.message || t('browserView.streamError')
+        }, 1600)
+      } else {
+        streamError.value = message.message || t('browserView.streamError')
+      }
       break
 
     case 'browser_crashed':
@@ -482,16 +788,63 @@ function handleMessage(message) {
       streamError.value = message.message || t('browserView.browserRestartFailed')
       break
 
+    case 'stream_recovered':
+      console.info('[SB][stream] stream_recovered')
+      if (streamErrorTimer) {
+        clearTimeout(streamErrorTimer)
+        streamErrorTimer = null
+      }
+      streamError.value = ''
+      break
+
+    case 'domain_blocked':
+      isPageLoading.value = false
+      if (message.blockedUrl && !urlFocused.value) {
+        urlInput.value = message.blockedUrl
+      }
+      console.warn('[SB][policy] blocked by domain restrictions', {
+        blockedUrl: message.blockedUrl,
+        allowedDomains: message.allowedDomains || []
+      })
+      break
+
     case 'network_stats':
       if (message.network) {
         remoteNetwork.value = message.network
       }
       break
 
+    case 'remote_cursor':
+      remoteCursor.value = {
+        visible: true,
+        x: Number(message.x || 0),
+        y: Number(message.y || 0),
+        button: message.button || 'none',
+        updatedAt: Date.now()
+      }
+      updateRemoteCursorOverlay()
+      break
+
     case 'error':
       console.error('Server error:', message.error)
+      streamError.value = message.error || streamError.value
       break
   }
+}
+
+function normalizeTabs(rawTabs) {
+  const unique = new Map()
+  for (const tab of rawTabs || []) {
+    const id = tab.tab_identifier || tab.tabIdentifier || `${tab.index || 0}_${tab.url || 'about:blank'}`
+    if (unique.has(id)) continue
+    unique.set(id, {
+      ...tab,
+      tab_identifier: id,
+      tabIdentifier: id,
+      isReady: tab.isReady !== false
+    })
+  }
+  return Array.from(unique.values())
 }
 
 function checkDialogState() {
@@ -515,14 +868,25 @@ function handleFrame(data) {
   }
 
   frameSrc.value = url
+  lastFrameAt = Date.now()
+  noFrameWarnStreak = 0
   frameCount++
   pendingFrames = Math.max(0, pendingFrames - 1)
+  if (streamError.value) streamError.value = ''
+  if (isPageLoading.value) isPageLoading.value = false
+  updateRemoteCursorOverlay()
 
   // 带宽统计
   const dataSize = data.size || data.byteLength || 0
   bytesThisSecond += dataSize
 
   const now = Date.now()
+  if (currentFrameServerTs > 0) {
+    const sampleLatency = Math.max(0, now - currentFrameServerTs)
+    streamLatencyMs = streamLatencyMs <= 0
+      ? sampleLatency
+      : Math.round(streamLatencyMs * 0.7 + sampleLatency * 0.3)
+  }
   if (now - lastFpsUpdate >= 1000) {
     fps.value = frameCount
     frameCount = 0
@@ -532,6 +896,48 @@ function handleFrame(data) {
     bandwidth.value = bytesThisSecond
     bytesThisSecond = 0
     lastBandwidthCalc = now
+  }
+
+  if (now - lastFrameHealthLogAt >= 5000) {
+    const idleMs = now - lastFrameAt
+    console.info('[SB][stream] frame-health', {
+      fps: fps.value,
+      quality: quality.value,
+      pendingFrames,
+      bandwidth: bandwidth.value,
+      streamLatencyMs,
+      idleMs,
+      tabs: tabs.value.length,
+      activeTabIndex: activeTabIndex.value
+    })
+    lastFrameHealthLogAt = now
+  }
+}
+
+function updateRemoteCursorOverlay() {
+  if (!remoteCursor.value.visible || !streamContainer.value || !streamImage.value || !frameSrc.value) {
+    remoteCursorStyle.value = { display: 'none' }
+    return
+  }
+
+  if (Date.now() - remoteCursor.value.updatedAt > 5000) {
+    remoteCursorStyle.value = { display: 'none' }
+    return
+  }
+
+  const containerRect = streamContainer.value.getBoundingClientRect()
+  const imageRect = streamImage.value.getBoundingClientRect()
+  if (!imageRect.width || !imageRect.height) {
+    remoteCursorStyle.value = { display: 'none' }
+    return
+  }
+
+  const left = (remoteCursor.value.x / 1280) * imageRect.width + (imageRect.left - containerRect.left)
+  const top = (remoteCursor.value.y / 720) * imageRect.height + (imageRect.top - containerRect.top)
+  remoteCursorStyle.value = {
+    display: 'block',
+    left: `${left}px`,
+    top: `${top}px`
   }
 }
 
@@ -543,7 +949,7 @@ function startFeedback() {
         data: {
           fps: fps.value,
           pendingFrames: pendingFrames,
-          rtt: 50
+          rtt: streamLatencyMs > 0 ? streamLatencyMs : 0
         }
       }))
     }
@@ -554,25 +960,34 @@ function startFeedback() {
 
 function retryConnect() {
   streamError.value = ''
-  window.location.reload()
+  manualClose = false
+  if (ws) ws.close()
+  connect()
 }
 
 // ==================== Tab 操作 ====================
 
 function switchTab(index) {
+  if (!canSendUserOperation.value) return
   if (index === activeTabIndex.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
+    isPageLoading.value = true
     ws.send(JSON.stringify({ type: 'tab_switch', tabIndex: index }))
+    setTimeout(() => sendTabListRequest('tab-switch-immediate', true), 120)
   }
 }
 
 function createNewTab() {
+  if (!canSendUserOperation.value) return
+  if (!canCreateTab.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
+    isPageLoading.value = true
     ws.send(JSON.stringify({ type: 'tab_new' }))
   }
 }
 
 function closeTab(index) {
+  if (!canSendUserOperation.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'tab_close', tabIndex: index }))
   }
@@ -581,6 +996,7 @@ function closeTab(index) {
 // ==================== 对话框响应 ====================
 
 function respondDialog(accept) {
+  if (!canSendUserOperation.value) return
   if (!pendingDialog.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
@@ -615,6 +1031,7 @@ function getRelativeCoords(event) {
 }
 
 function sendInput(event) {
+  if (!canSendUserOperation.value) return
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'input', event }))
   }
@@ -624,12 +1041,16 @@ function sendInput(event) {
 
 function handleMouseMove(event) {
   if (!isConnected.value) return
+  const now = performance.now()
+  if (now - lastMouseMoveSentAt < 16) return
+  lastMouseMoveSentAt = now
   const { x, y } = getRelativeCoords(event)
   sendInput({ type: 'mousemove', x, y })
 }
 
 function handleMouseDown(event) {
   if (!isConnected.value) return
+  if (event.button === 1) event.preventDefault()
   mouseDownInStream = true
   const { x, y } = getRelativeCoords(event)
   sendInput({ type: 'mousedown', x, y, button: event.button })
@@ -642,6 +1063,20 @@ function handleMouseUp(event) {
   mouseDownInStream = false
   const { x, y } = getRelativeCoords(event)
   sendInput({ type: 'mouseup', x, y, button: event.button })
+  if (event.button === 1) {
+    // 中键打开新标签时主动拉取一次 tab 列表，避免 UI 不刷新
+    setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        sendTabListRequest('middle-click-up', false)
+      }
+    }, 250)
+  }
+}
+
+function handleAuxClick(event) {
+  if (!isConnected.value) return
+  if (event.button !== 1) return
+  event.preventDefault()
 }
 
 function handleWheel(event) {
@@ -678,6 +1113,7 @@ const INTERCEPT_CTRL_KEYS = new Set([
 
 async function handleKeyDown(event) {
   if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
 
   // URL 输入框聚焦时不拦截（除了 Escape）
   if (urlFocused.value) {
@@ -689,7 +1125,7 @@ async function handleKeyDown(event) {
   }
 
   // 其他输入框不拦截
-  if (event.target.tagName === 'INPUT' && event.target !== streamContainer.value) return
+  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') && event.target !== streamContainer.value) return
 
   // 剪贴板操作特殊处理
   if (event.ctrlKey && !event.altKey && !event.metaKey) {
@@ -756,8 +1192,9 @@ async function handleKeyDown(event) {
 
 function handleKeyUp(event) {
   if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
   if (urlFocused.value) return
-  if (event.target.tagName === 'INPUT' && event.target !== streamContainer.value) return
+  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') && event.target !== streamContainer.value) return
 
   event.preventDefault()
   sendInput({
@@ -773,9 +1210,59 @@ function handleKeyUp(event) {
   })
 }
 
+function handleMobileKeyboardInput(event) {
+  if (!isConnected.value || !canSendUserOperation.value) return
+  const el = event.target
+  const next = String(el?.value || '')
+  const prev = mobileKeyboardBuffer
+
+  if (next.startsWith(prev) && next.length > prev.length) {
+    const inserted = next.slice(prev.length)
+    if (inserted) sendInput({ type: 'keypress', text: inserted })
+  } else if (prev.startsWith(next) && prev.length > next.length) {
+    const removed = prev.length - next.length
+    for (let i = 0; i < removed; i++) {
+      sendInput({ type: 'keydown', key: 'Backspace', code: 'Backspace', modifiers: { ctrl: false, alt: false, shift: false, meta: false } })
+      sendInput({ type: 'keyup', key: 'Backspace', code: 'Backspace', modifiers: { ctrl: false, alt: false, shift: false, meta: false } })
+    }
+  } else if (next) {
+    sendInput({ type: 'keypress', text: next })
+  }
+
+  mobileKeyboardBuffer = next
+  if (mobileKeyboardBuffer.length > 48 && el) {
+    mobileKeyboardBuffer = mobileKeyboardBuffer.slice(-24)
+    el.value = mobileKeyboardBuffer
+  }
+}
+
+function handleMobileKeyboardKeyDown(event) {
+  if (!isConnected.value || !canSendUserOperation.value) return
+  const key = event.key
+  if (!key) return
+  if (key.length === 1) return
+
+  const specialKeys = new Set([
+    'Enter', 'Tab', 'Escape', 'Backspace', 'Delete',
+    'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+    'Home', 'End', 'PageUp', 'PageDown'
+  ])
+  if (!specialKeys.has(key)) return
+
+  event.preventDefault()
+  sendInput({ type: 'keydown', key, code: event.code || key, modifiers: { ctrl: false, alt: false, shift: false, meta: false } })
+  sendInput({ type: 'keyup', key, code: event.code || key, modifiers: { ctrl: false, alt: false, shift: false, meta: false } })
+
+  if (key === 'Enter' && mobileKeyboardInputRef.value) {
+    mobileKeyboardInputRef.value.value = ''
+    mobileKeyboardBuffer = ''
+  }
+}
+
 // ==================== URL 导航 ====================
 
 function navigateToUrl() {
+  if (!canSendUserOperation.value) return
   if (!urlInput.value) return
 
   let url = urlInput.value
@@ -785,7 +1272,7 @@ function navigateToUrl() {
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     isPageLoading.value = true
-    ws.send(JSON.stringify({ type: 'navigate', url }))
+    ws.send(JSON.stringify({ type: 'navigate', url, tabIndex: activeTabIndex.value }))
   }
 
   // 失焦 URL 输入框
@@ -798,16 +1285,43 @@ function navigateToUrl() {
 function toggleFiles() {
   showFiles.value = !showFiles.value
   if (showFiles.value) {
+    hasFilesBadge.value = false
     loadFiles()
+    loadActiveDownloads()
   }
 }
 
 async function loadFiles() {
   try {
     const response = await api.get(`/api/files/${browserId.value}`)
-    downloadFiles.value = response.data
+    const next = [...response.data].sort((a, b) => {
+      const ta = new Date(a.mtime).getTime()
+      const tb = new Date(b.mtime).getTime()
+      return tb - ta
+    })
+    if (!hasLoadedFilesBaseline.value) {
+      hasLoadedFilesBaseline.value = true
+    } else if (next.length > downloadFiles.value.length) {
+      hasFilesBadge.value = true
+      showFiles.value = true
+    }
+    if (!isSameDownloadedFiles(downloadFiles.value, next)) {
+      downloadFiles.value = next
+    }
   } catch (e) {
     console.error('Failed to load file list:', e)
+  }
+}
+
+async function loadActiveDownloads() {
+  try {
+    const response = await api.get(`/api/files/${browserId.value}/active`)
+    const next = (response.data || []).map(normalizeActiveDownload)
+    if (!isSameActiveDownloads(activeDownloads.value, next)) {
+      activeDownloads.value = next
+    }
+  } catch (e) {
+    console.error('Failed to load active downloads:', e)
   }
 }
 
@@ -825,12 +1339,102 @@ async function deleteFile(filename) {
   }
 }
 
+async function removeAllFiles() {
+  try {
+    await api.delete(`/api/files/${browserId.value}`)
+    await loadFiles()
+  } catch (e) {
+    console.error('Failed to remove all files:', e)
+  }
+}
+
+async function cancelDownload(guid) {
+  try {
+    await api.post(`/api/files/${browserId.value}/cancel/${encodeURIComponent(guid)}`)
+    activeDownloads.value = activeDownloads.value.filter((x) => x.guid !== guid)
+  } catch (e) {
+    console.error('Failed to cancel download:', e)
+  }
+}
+
+function normalizeActiveDownload(item) {
+  return {
+    guid: item.guid,
+    filename: item.filename || '',
+    receivedBytes: Number(item.receivedBytes || 0),
+    totalBytes: Number(item.totalBytes || 0),
+    progress: Number(item.progress || 0),
+    state: item.state || 'inProgress'
+  }
+}
+
+function isSameDownloadedFiles(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] || {}
+    const y = b[i] || {}
+    if (x.name !== y.name) return false
+    if (Number(x.size || 0) !== Number(y.size || 0)) return false
+    if (new Date(x.mtime).getTime() !== new Date(y.mtime).getTime()) return false
+  }
+  return true
+}
+
+function isSameActiveDownloads(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] || {}
+    const y = b[i] || {}
+    if (x.guid !== y.guid) return false
+    if (x.filename !== y.filename) return false
+    if (Number(x.receivedBytes || 0) !== Number(y.receivedBytes || 0)) return false
+    if (Number(x.totalBytes || 0) !== Number(y.totalBytes || 0)) return false
+    if (Number(x.progress || 0) !== Number(y.progress || 0)) return false
+    if (x.state !== y.state) return false
+  }
+  return true
+}
+
+function handleDownloadProgress(message) {
+  const guid = String(message.guid || '')
+  if (!guid) return
+  const item = normalizeActiveDownload({
+    guid,
+    filename: message.filename,
+    receivedBytes: message.receivedBytes,
+    totalBytes: message.totalBytes,
+    progress: message.progress,
+    state: message.state
+  })
+  const idx = activeDownloads.value.findIndex((x) => x.guid === guid)
+  if (message.state === 'completed' || message.state === 'canceled') {
+    if (idx !== -1) {
+      activeDownloads.value.splice(idx, 1)
+    }
+    loadFiles()
+    return
+  }
+  if (idx === -1) {
+    activeDownloads.value.unshift(item)
+  } else {
+    activeDownloads.value[idx] = item
+  }
+  downloadNotice.value = t('browserView.downloadingNotice', {
+    filename: item.filename || t('browserView.downloadingUnknown'),
+    progress: item.progress
+  })
+}
+
 function triggerFileUpload() {
+  if (!canSendUserOperation.value) return
   pendingFileUpload.value = true
   fileInput.value.click()
 }
 
 function cancelFileChooser() {
+  if (!canSendUserOperation.value) return
   showFileChooser.value = false
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'file_response', cancelled: true }))
@@ -875,6 +1479,17 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
+function formatFileTime(value) {
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '-'
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${y}-${m}-${day} ${hh}:${mm}`
+}
+
 // ==================== 带宽格式化 ====================
 
 function formatBandwidth(bytesPerSec) {
@@ -916,6 +1531,7 @@ function fallbackCopyToClipboard(text) {
 // paste 事件处理（在 HTTP 环境下也能可靠地读取剪贴板）
 function handlePaste(event) {
   if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
   // URL 输入框或对话框输入框聚焦时不拦截
   if (urlFocused.value) return
   if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
@@ -940,6 +1556,7 @@ function handlePaste(event) {
 
 function handleDragOver(event) {
   if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
   isDragging.value = true
   event.dataTransfer.dropEffect = 'copy'
 }
@@ -954,6 +1571,7 @@ function handleDragLeave(event) {
 async function handleDrop(event) {
   isDragging.value = false
   if (!isConnected.value) return
+  if (!canSendUserOperation.value) return
 
   const files = event.dataTransfer.files
   if (!files || files.length === 0) return
@@ -987,13 +1605,93 @@ function handleGlobalMouseUp() {
   mouseDownInStream = false
 }
 
-onMounted(() => {
-  connect()
+function sendTabListRequest(reason, refreshMeta = false) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+  console.info('[SB][tabs] request', { reason, refreshMeta })
+  ws.send(JSON.stringify({ type: 'tab_list', reason, refreshMeta }))
+}
 
+function logTabSnapshot(source) {
+  const compact = (tabs.value || []).map((tab, idx) => {
+    const rawId = tab.tab_identifier || tab.tabIdentifier || `idx-${idx}`
+    const id = String(rawId).slice(-12)
+    const title = String(tab.title || 'New Tab').slice(0, 28)
+    return `${idx === activeTabIndex.value ? '*' : ''}${idx}:${id}:${title}:${tab.url || ''}:${tab.isReady === false ? 'NR' : 'R'}`
+  }).join(' | ')
+  if (compact === lastTabSnapshot) return
+  lastTabSnapshot = compact
+  console.info('[SB][tabs]', { source, creatingTab: creatingTab.value, tabs: compact })
+}
+
+function startWatchdogs() {
+  if (streamWatchTimer) clearInterval(streamWatchTimer)
+  streamWatchTimer = setInterval(() => {
+    if (!isConnected.value) return
+    const idleMs = Date.now() - lastFrameAt
+    if (idleMs > 8000 && ws && ws.readyState === WebSocket.OPEN) {
+      sendTabListRequest('watchdog-idle', false)
+    }
+    if (idleMs > 15000) {
+      noFrameWarnStreak += 1
+      const wsState = getWsStateText()
+      console.warn('[SB][stream] watchdog no-frame', {
+        idleMs,
+        noFrameWarnStreak,
+        wsState,
+        reconnectAttempts
+      })
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        sendTabListRequest('watchdog-no-frame', true)
+        const now = Date.now()
+        if (now - lastRecoverRequestAt > 5000) {
+          lastRecoverRequestAt = now
+          ws.send(JSON.stringify({ type: 'stream_recover', reason: 'watchdog-no-frame', idleMs }))
+          pushWsEvent('tx', 'stream_recover', `idleMs=${idleMs}`)
+        }
+      }
+      // Only reconnect on persistent no-frame + websocket non-open.
+      if (idleMs > 25000 && (!ws || ws.readyState !== WebSocket.OPEN) && noFrameWarnStreak >= 2) {
+        streamError.value = t('browserView.streamError')
+        scheduleReconnect()
+      }
+    } else {
+      noFrameWarnStreak = 0
+    }
+  }, 2000)
+
+  if (tabSyncTimer) clearInterval(tabSyncTimer)
+  tabSyncTimer = setInterval(() => {
+    if (isConnected.value && ws && ws.readyState === WebSocket.OPEN) {
+      sendTabListRequest('periodic-sync', true)
+    }
+  }, 6000)
+
+  if (filesSyncTimer) clearInterval(filesSyncTimer)
+  filesSyncTimer = setInterval(() => {
+    if (!isConnected.value) return
+    loadActiveDownloads()
+    loadFiles()
+  }, 1200)
+
+  if (wsDebugTimer) clearInterval(wsDebugTimer)
+  wsDebugTimer = setInterval(() => {
+    wsDebug.value.readyStateText = getWsStateText()
+  }, 500)
+}
+
+onMounted(() => {
+  manualClose = false
+  loadBrowserConfig()
+  connect()
+  startWatchdogs()
+
+  updateTouchMode()
   window.addEventListener('keydown', handleKeyDown)
   window.addEventListener('keyup', handleKeyUp)
   window.addEventListener('paste', handlePaste)
   window.addEventListener('mouseup', handleGlobalMouseUp)
+  window.addEventListener('resize', updateRemoteCursorOverlay)
+  window.addEventListener('resize', updateTouchMode)
 
   // 自动聚焦串流容器
   nextTick(() => {
@@ -1002,6 +1700,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  manualClose = true
   if (ws) {
     ws.close()
   }
@@ -1009,6 +1708,15 @@ onUnmounted(() => {
   if (feedbackTimer) {
     clearInterval(feedbackTimer)
   }
+  if (streamErrorTimer) {
+    clearTimeout(streamErrorTimer)
+    streamErrorTimer = null
+  }
+  if (streamWatchTimer) clearInterval(streamWatchTimer)
+  if (tabSyncTimer) clearInterval(tabSyncTimer)
+  if (filesSyncTimer) clearInterval(filesSyncTimer)
+  if (wsDebugTimer) clearInterval(wsDebugTimer)
+  if (reconnectTimer) clearTimeout(reconnectTimer)
 
   if (frameSrc.value) {
     URL.revokeObjectURL(frameSrc.value)
@@ -1018,7 +1726,48 @@ onUnmounted(() => {
   window.removeEventListener('keyup', handleKeyUp)
   window.removeEventListener('paste', handlePaste)
   window.removeEventListener('mouseup', handleGlobalMouseUp)
+  window.removeEventListener('resize', updateRemoteCursorOverlay)
+  window.removeEventListener('resize', updateTouchMode)
 })
+
+function getWsStateText() {
+  if (!ws) return 'NULL'
+  const stateMap = {
+    [WebSocket.CONNECTING]: 'CONNECTING',
+    [WebSocket.OPEN]: 'OPEN',
+    [WebSocket.CLOSING]: 'CLOSING',
+    [WebSocket.CLOSED]: 'CLOSED'
+  }
+  return stateMap[ws.readyState] || `STATE_${ws.readyState}`
+}
+
+function pushWsEvent(dir, type, extra = '') {
+  const now = Date.now()
+  const item = {
+    ts: new Date(now).toISOString().slice(11, 23),
+    dir,
+    type,
+    extra
+  }
+  const next = [item, ...(wsDebug.value.events || [])].slice(0, 12)
+  wsDebug.value.events = next
+  if (dir === 'rx') {
+    wsDebug.value.lastRxAt = now
+    wsDebug.value.lastRxType = type
+    wsDebug.value.rxCount += 1
+  } else if (dir === 'tx') {
+    wsDebug.value.lastTxAt = now
+    wsDebug.value.lastTxType = type
+    wsDebug.value.txCount += 1
+  }
+}
+
+function formatAge(ts) {
+  const n = Number(ts || 0)
+  if (!n) return '-'
+  const age = Math.max(0, Date.now() - n)
+  return `${age}ms`
+}
 </script>
 
 <style scoped>
@@ -1035,11 +1784,15 @@ onUnmounted(() => {
 .toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 8px;
   padding: 6px 12px;
+  min-height: 44px;
   background: #2a2a2a;
   border-bottom: 1px solid #3a3a3a;
   flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .nav-buttons {
@@ -1061,6 +1814,10 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   transition: background 0.15s, color 0.15s;
+}
+
+.nav-btn i {
+  font-size: 13px;
 }
 
 .nav-btn:hover:not(:disabled) {
@@ -1085,7 +1842,7 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   gap: 8px;
-  max-width: 600px;
+  max-width: 700px;
   min-width: 0;
 }
 
@@ -1093,6 +1850,10 @@ onUnmounted(() => {
   flex: 1;
   position: relative;
   min-width: 0;
+}
+
+.url-wrapper.is-loading-url {
+  min-height: 32px;
 }
 
 .url-input {
@@ -1132,30 +1893,111 @@ onUnmounted(() => {
 .toolbar-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   flex-shrink: 0;
   margin-left: auto;
-}
-
-.btn-exit {
-  background: #e74c3c;
-  color: white;
-  font-weight: 600;
   white-space: nowrap;
+  min-width: 0;
 }
 
-.btn-exit:hover {
-  background: #c0392b;
+.tool-icon-btn {
+  width: 30px;
+  height: 30px;
+  border: 1px solid #3d3d3d;
+  border-radius: 7px;
+  background: #313131;
+  color: #d8d8d8;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
-.status {
+.tool-icon-btn i {
   font-size: 12px;
-  color: #888;
-  white-space: nowrap;
 }
 
-.status.connected {
-  color: var(--success-color);
+.tool-icon-btn:hover:not(:disabled) {
+  background: #3d3d3d;
+  color: #fff;
+  border-color: #4a4a4a;
+}
+
+.tool-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tool-icon-btn.primary {
+  background: #3076d0;
+  border-color: #3076d0;
+  color: #fff;
+}
+
+.tool-icon-btn.primary:hover:not(:disabled) {
+  background: #3d8cef;
+  border-color: #3d8cef;
+}
+
+.tool-icon-btn.danger {
+  background: #d44d3f;
+  border-color: #d44d3f;
+  color: #fff;
+}
+
+.tool-icon-btn.danger:hover:not(:disabled) {
+  background: #ba3d30;
+  border-color: #ba3d30;
+}
+
+.mobile-kb-btn {
+  color: #ffe39b;
+}
+
+.ai-override-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #f7cb5e;
+}
+
+.ai-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+
+.ai-toggle-icon i {
+  font-size: 13px;
+}
+
+.ai-passive-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: #f39c12;
+  font-size: 12px;
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #8a8a8a;
+  border: 1px solid #7a7a7a;
+  display: inline-block;
+}
+
+.status-dot.connected {
+  background: #2ecc71;
+  border-color: #2ecc71;
+  box-shadow: 0 0 6px rgba(46, 204, 113, 0.55);
 }
 
 .stats {
@@ -1167,6 +2009,10 @@ onUnmounted(() => {
 
 .remote-net {
   color: #6cc;
+}
+
+.compact {
+  flex-shrink: 0;
 }
 
 .active-badge {
@@ -1184,6 +2030,46 @@ onUnmounted(() => {
   font-family: monospace;
 }
 
+.download-live-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #e8f3ff;
+  color: #1b66d6;
+  border: 1px solid #b9d7ff;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.files-btn {
+  position: relative;
+  width: auto;
+  min-width: 38px;
+  padding: 0 8px;
+  gap: 4px;
+}
+
+.files-count {
+  font-size: 10px;
+  font-weight: 700;
+  color: #dfe7ff;
+  font-family: monospace;
+}
+
+.files-badge-dot {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff3b30;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
 /* ==================== Tab 栏 ==================== */
 
 .tab-bar {
@@ -1198,7 +2084,8 @@ onUnmounted(() => {
 
 .tab-list {
   display: flex;
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
@@ -1240,6 +2127,15 @@ onUnmounted(() => {
   background: #2a1a0a;
 }
 
+.tab-item.not-ready {
+  background: #3f3a1f;
+}
+
+.tab-item.not-ready.active {
+  background: #4a431f;
+  border-bottom-color: #f1c40f;
+}
+
 .tab-title {
   flex: 1;
   font-size: 12px;
@@ -1259,6 +2155,15 @@ onUnmounted(() => {
   cursor: pointer;
 }
 
+.tab-ready-indicator {
+  font-size: 10px;
+  color: #f1c40f;
+}
+
+.tab-ready-indicator i {
+  font-size: 8px;
+}
+
 .tab-close {
   background: none;
   border: none;
@@ -1276,19 +2181,45 @@ onUnmounted(() => {
 }
 
 .tab-new-btn {
-  background: none;
-  border: none;
-  border-left: 1px solid #3a3a3a;
+  background: #2f2f2f;
+  border: 1px solid #3a3a3a;
   color: #888;
   font-size: 18px;
   cursor: pointer;
-  padding: 0 12px;
-  transition: background 0.15s, color 0.15s;
+  height: 28px;
+  min-width: 30px;
+  margin: 4px 6px;
+  border-radius: 6px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
 .tab-new-btn:hover {
   background: #353535;
   color: white;
+}
+
+.tab-new-btn.inline {
+  flex-shrink: 0;
+}
+
+@media (max-width: 1200px) {
+  .remote-net,
+  .active-badge {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .stats {
+    display: none;
+  }
+}
+
+.tab-new-btn.blocked {
+  background: #4d1f1f;
+  border-color: #b43b3b;
+  color: #ff7b7b;
+  cursor: not-allowed;
 }
 
 /* ==================== 串流画面 ==================== */
@@ -1310,6 +2241,64 @@ onUnmounted(() => {
   object-fit: contain;
   user-select: none;
   -webkit-user-drag: none;
+}
+
+.blank-hint-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.blank-hint-card {
+  background: rgba(24, 24, 24, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+  padding: 10px 14px;
+  color: #f5f7fb;
+  max-width: min(580px, 80%);
+  text-align: center;
+}
+
+.blank-hint-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.blank-hint-sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #d0d9e6;
+}
+
+.blank-hint-url {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #8ec5ff;
+  font-family: monospace;
+  word-break: break-all;
+}
+
+.remote-cursor {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin-left: -7px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  border: 2px solid #ff2d55;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  z-index: 60;
+}
+
+.remote-cursor.pressing {
+  transform: scale(0.8);
+  background: #ff2d55;
 }
 
 .connecting-overlay {
@@ -1366,6 +2355,10 @@ onUnmounted(() => {
   font-size: 48px;
   display: block;
   margin-bottom: 16px;
+}
+
+.error-icon i {
+  font-size: 44px;
 }
 
 .error-message {
@@ -1486,6 +2479,7 @@ onUnmounted(() => {
   z-index: 100;
 }
 
+
 .files-header {
   display: flex;
   justify-content: space-between;
@@ -1497,6 +2491,20 @@ onUnmounted(() => {
 .files-header h3 {
   font-size: 16px;
   font-weight: 600;
+}
+
+.files-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.download-notice {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #3b4a00;
+  background: #fff8d6;
+  border-bottom: 1px solid #f0e0a0;
 }
 
 .files-list {
@@ -1513,9 +2521,10 @@ onUnmounted(() => {
 
 .file-item {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 8px;
   border-radius: 8px;
   transition: background 0.2s;
 }
@@ -1524,20 +2533,118 @@ onUnmounted(() => {
   background: #f5f5f5;
 }
 
+.file-item.downloading {
+  background: #f7fbff;
+  border: 1px solid #d7e8ff;
+}
+
+.file-left {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .file-name {
   flex: 1;
-  font-size: 14px;
+  font-size: 12px;
+  line-height: 1.3;
   word-break: break-all;
 }
 
-.file-size {
-  font-size: 12px;
+.file-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 3px;
+  font-size: 11px;
   color: var(--text-secondary);
 }
 
 .file-actions {
   display: flex;
-  gap: 4px;
+  gap: 6px;
+}
+
+.file-actions.vertical {
+  flex-direction: column;
+}
+
+.icon-btn {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  font-size: 12px;
+  line-height: 1;
+  box-shadow: none;
+}
+
+.icon-btn.download {
+  background: #4a90e2;
+  color: #fff;
+}
+
+.icon-btn.delete {
+  background: #e74c3c;
+  color: #fff;
+}
+
+.icon-btn.cancel {
+  background: #f39c12;
+  color: #fff;
+}
+
+.file-status {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.file-status.done {
+  background: #2ecc71;
+  color: #fff;
+  font-size: 11px;
+}
+
+.file-done-meta {
+  color: #24a85e;
+  font-weight: 600;
+}
+
+.file-status.spinner {
+  border: 2px solid #bcd8ff;
+  border-top-color: #3d8bff;
+  animation: spin 0.9s linear infinite;
+}
+
+.file-progress-wrap {
+  margin-top: 6px;
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  background: #dce6f5;
+  overflow: hidden;
+}
+
+.file-progress-bar {
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #5aa0ff, #2f78f4);
+  transition: width 0.2s ease;
 }
 
 .files-footer {
@@ -1547,5 +2654,15 @@ onUnmounted(() => {
 
 .files-footer button {
   width: 100%;
+}
+
+.mobile-keyboard-bridge {
+  position: fixed;
+  left: -9999px;
+  top: -9999px;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
 }
 </style>

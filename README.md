@@ -2,6 +2,8 @@
 
 基于 Web 的远程浏览器共享系统。在服务器上运行 Chrome，通过浏览器即可远程访问和操控。
 
+> 适用于远程桌面、自动化测试、AI 驱动 Web 操作等场景。
+
 ## 功能
 
 - **实时串流** — 服务端 Chrome 画面实时推送到浏览器，支持自适应画质/帧率
@@ -85,6 +87,27 @@ shared-browser/
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `CHROME_PATH` | 系统默认路径 | Chrome 可执行文件路径 |
 | `JWT_SECRET` | 内置默认值 | JWT 密钥（生产环境应修改） |
+
+此外可在启动目录放置 `params.json`（参考 `params.example.json`）：
+- 端口/监听地址（`port`、`host`）
+- MCP 开关与路由前缀（`mcp.enabled`、`mcp.routePrefix`）
+- MCP 调试 URL（`mcp-debug: true` 启用 `/mcp-debug/:browserId/*`）
+- 浏览器空闲自动关闭（`idleClose.timeoutMs`）
+- 截图超时保护（`stream.screenshotTimeoutMs`）
+
+## 开发
+
+```bash
+# 安装依赖
+npm install
+cd client && npm install
+
+# 构建前端
+npm run client:build
+
+# 启动服务
+npm start
+```
 
 ## 许可证
 

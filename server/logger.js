@@ -10,10 +10,16 @@ const config = require('./config');
 class BrowserLogger {
   constructor() {
     this.logDir = path.join(config.dataDir, 'logs');
+    this.textLogDir = path.join(__dirname, '..', 'logs');
     if (!fs.existsSync(this.logDir)) {
       fs.mkdirSync(this.logDir, { recursive: true });
     }
+    if (!fs.existsSync(this.textLogDir)) {
+      fs.mkdirSync(this.textLogDir, { recursive: true });
+    }
     this.maxLogEntries = 1000; // 每个浏览器最多保存的日志条数
+    this.maxLogFileBytes = Number(config.logging?.maxFileBytes || 5 * 1024 * 1024);
+    this.maxLogFiles = Number(config.logging?.maxFiles || 5);
   }
 
   _getLogFile(browserId) {
@@ -43,6 +49,51 @@ class BrowserLogger {
     }
   }
 
+  _getTextLogFile(baseName) {
+    return path.join(this.textLogDir, `${baseName}.log`);
+  }
+
+  _rotateTextLogIfNeeded(baseName) {
+    const currentFile = this._getTextLogFile(baseName);
+    try {
+      if (!fs.existsSync(currentFile)) return;
+      const size = fs.statSync(currentFile).size;
+      if (size < this.maxLogFileBytes) return;
+      for (let i = this.maxLogFiles - 1; i >= 1; i--) {
+        const src = `${currentFile}.${i}`;
+        const dst = `${currentFile}.${i + 1}`;
+        if (fs.existsSync(src)) {
+          try {
+            fs.renameSync(src, dst);
+          } catch (e) {}
+        }
+      }
+      fs.renameSync(currentFile, `${currentFile}.1`);
+    } catch (e) {
+      console.error(`[Logger] Failed to rotate text log ${baseName}: ${e.message}`);
+    }
+  }
+
+  _appendTextLog(baseName, line) {
+    const currentFile = this._getTextLogFile(baseName);
+    this._rotateTextLogIfNeeded(baseName);
+    try {
+      fs.appendFileSync(currentFile, `${line}\n`, 'utf8');
+    } catch (e) {
+      console.error(`[Logger] Failed to append text log ${baseName}: ${e.message}`);
+    }
+  }
+
+  _stringifyDetails(details) {
+    if (details === null || details === undefined) return '';
+    if (typeof details === 'string') return details;
+    try {
+      return JSON.stringify(details);
+    } catch (e) {
+      return String(details);
+    }
+  }
+
   /**
    * 记录日志
    * @param {string} browserId - 浏览器 ID
@@ -51,16 +102,21 @@ class BrowserLogger {
    * @param {*} details - 附加详情
    */
   log(browserId, level, message, details = null) {
+    const detailsText = this._stringifyDetails(details);
     const entry = {
       timestamp: new Date().toISOString(),
       level,
       message,
-      details: details !== null ? (typeof details === 'object' ? JSON.stringify(details) : String(details)) : null
+      details: detailsText || null
     };
 
     const logs = this._readLogs(browserId);
     logs.push(entry);
     this._writeLogs(browserId, logs);
+
+    const textLine = `[${entry.timestamp}] [${level.toUpperCase()}] [${browserId}] ${message}${detailsText ? ` | ${detailsText}` : ''}`;
+    this._appendTextLog('server', textLine);
+    this._appendTextLog(browserId, textLine);
 
     // 同时输出到控制台
     const prefix = `[Browser:${browserId}]`;

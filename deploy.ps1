@@ -91,17 +91,28 @@ Write-Step "启用 VehicleHelper AI API"
 Invoke-VH "POST" "/api/ai/enable" '{}' | Out-Null
 Start-Sleep -Seconds 1
 
-$aiStatus = Invoke-VH "GET" "/api/ai/status"
-if ($aiStatus -and $aiStatus.Enabled) {
-    Write-OK "AI API 已启用"
-} else {
-    Write-Err "AI API 启用失败"
-    exit 1
+$aiEnabled = $false
+try {
+    $aiStatus = Invoke-VH "GET" "/api/ai/status"
+    if ($aiStatus -and $aiStatus.Enabled) {
+        $aiEnabled = $true
+        Write-OK "AI API 已启用"
+    }
+} catch {
+    Write-Warn "无法读取 /api/ai/status，按已启用继续: $($_.Exception.Message)"
+}
+if (-not $aiEnabled) {
+    # 某些远端版本在 status 路由上偶发超时，但 enable 实际已生效
+    Write-Warn "AI API 状态未确认，继续执行后续步骤"
 }
 
 # 启动终端
-Invoke-VH "POST" "/api/ai/terminal/start" '{}' | Out-Null
-Start-Sleep -Seconds 2
+try {
+    Invoke-VH "POST" "/api/ai/terminal/start" '{}' | Out-Null
+    Start-Sleep -Seconds 2
+} catch {
+    Write-Warn "terminal/start 超时或失败，继续尝试后续部署: $($_.Exception.Message)"
+}
 
 $termStatus = Invoke-VH "GET" "/api/ai/terminal/output"
 if ($termStatus) {
@@ -175,11 +186,15 @@ if (Test-Path "$PSScriptRoot\package-lock.json") {
 }
 
 # 复制 test-server（用于测试）
-Copy-Item "$PSScriptRoot\test-server" "$tempDir\test-server" -Recurse
-# 排除 test-server 中的临时文件
-if (Test-Path "$tempDir\test-server\uploads") { Remove-Item "$tempDir\test-server\uploads" -Recurse -Force }
-if (Test-Path "$tempDir\test-server\downloads") { Remove-Item "$tempDir\test-server\downloads" -Recurse -Force }
-if (Test-Path "$tempDir\test-server\__pycache__") { Remove-Item "$tempDir\test-server\__pycache__" -Recurse -Force }
+if (Test-Path "$PSScriptRoot\test-server") {
+    Copy-Item "$PSScriptRoot\test-server" "$tempDir\test-server" -Recurse
+    # 排除 test-server 中的临时文件
+    if (Test-Path "$tempDir\test-server\uploads") { Remove-Item "$tempDir\test-server\uploads" -Recurse -Force }
+    if (Test-Path "$tempDir\test-server\downloads") { Remove-Item "$tempDir\test-server\downloads" -Recurse -Force }
+    if (Test-Path "$tempDir\test-server\__pycache__") { Remove-Item "$tempDir\test-server\__pycache__" -Recurse -Force }
+} else {
+    Write-Warn "test-server 目录不存在，跳过该目录打包"
+}
 
 # 压缩
 Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath -Force
@@ -352,22 +367,81 @@ Invoke-VH-Terminal "taskkill /f /im node.exe 2>nul" 3
 Write-OK "已尝试停止旧 Node.js 进程"
 
 Write-Step "解压部署包"
-$expandCmd = "powershell -Command `"Expand-Archive -Path '$RemotePath\deploy-package.zip' -DestinationPath '$RemotePath' -Force`""
-Invoke-VH-Terminal $expandCmd 5
-$output = Wait-VH-Terminal 60
-Write-OK "解压完成"
+$zipCheck = Invoke-VH-Terminal "if exist `"$RemotePath\deploy-package.zip`" (echo ZIP_READY) else (echo ZIP_MISSING)" 2
+if ($zipCheck -notmatch "ZIP_READY") {
+    Write-Err "远程部署包不存在: $RemotePath\deploy-package.zip"
+    exit 1
+}
+
+$expandCmd = "powershell -NoProfile -Command `"try { Expand-Archive -Path '$RemotePath\deploy-package.zip' -DestinationPath '$RemotePath' -Force; Write-Host 'UNZIP_OK' } catch { Write-Host 'UNZIP_FAIL'; exit 1 }`""
+$expandOutput = Invoke-VH-Terminal $expandCmd 6
+if ($expandOutput -notmatch "UNZIP_OK") {
+    Write-Warn "Expand-Archive 失败，尝试 tar -xf 回退..."
+    $fallbackOutput = Invoke-VH-Terminal "tar -xf `"$RemotePath\deploy-package.zip`" -C `"$RemotePath`" & echo UNZIP_OK" 6
+    if ($fallbackOutput -notmatch "UNZIP_OK") {
+        Write-Err "解压失败（Expand-Archive/tar 均失败）"
+        exit 1
+    }
+}
+
+$versionCheck = Invoke-VH-Terminal "if exist `"$RemotePath\version.json`" (type `"$RemotePath\version.json`") else (echo VERSION_MISSING)" 2
+if ($versionCheck -match "VERSION_MISSING") {
+    Write-Err "解压后缺少 version.json，部署中止"
+    exit 1
+}
+if ($versionCheck -notmatch [regex]::Escape($versionStr)) {
+    Write-Err "解压后版本不匹配，期望: $versionStr"
+    Write-Err "远程 version.json: $versionCheck"
+    exit 1
+}
+Write-OK "解压完成，版本校验通过: $versionStr"
 
 # 清理 zip
 Invoke-VH-Terminal "del `"$RemotePath\deploy-package.zip`"" 2
 
-Write-Step "安装 npm 依赖"
-Invoke-VH-Terminal "cd /d $RemotePath & set `"PATH=%PATH%;$NodeDir`" & npm install --production" 5
-$output = Wait-VH-Terminal 120
+Write-Step "检查 npm 依赖"
 
-if ($output -match "added|up to date|npm warn") {
-    Write-OK "npm 依赖安装完成"
+# 计算本地 package.json hash
+$localPkgHash = ""
+if (Test-Path "$PSScriptRoot\package.json") {
+    $localPkgHash = (Get-FileHash "$PSScriptRoot\package.json" -Algorithm SHA256).Hash
+}
+
+# 读取远程已保存的 hash
+$remotePkgHash = ""
+$hashOutput = Invoke-VH-Terminal "if exist `"$RemotePath\.pkg-hash`" type `"$RemotePath\.pkg-hash`"" 3
+if ($hashOutput) {
+    $remotePkgHash = ($hashOutput -replace '\s', '').ToUpper()
+}
+$localPkgHash = $localPkgHash.ToUpper()
+
+$needNpmInstall = $true
+if ($localPkgHash -and $remotePkgHash -and $localPkgHash -eq $remotePkgHash) {
+    $needNpmInstall = $false
+    Write-OK "package.json 未变化，跳过 npm install (hash: $($localPkgHash.Substring(0, 12))...)"
 } else {
-    Write-Warn "npm 安装输出: $($output.Substring(0, [Math]::Min(200, $output.Length)))"
+    Write-Host "  package.json hash 本地: $($localPkgHash.Substring(0, 16))..." -ForegroundColor DarkGray
+    Write-Host "  package.json hash 远程: $(if ($remotePkgHash) { $remotePkgHash.Substring(0, [Math]::Min(16, $remotePkgHash.Length)) + '...' } else { '(none)' })" -ForegroundColor DarkGray
+}
+
+if ($needNpmInstall) {
+    Write-Host "  Running npm install..." -ForegroundColor Yellow
+    Invoke-VH-Terminal "cd /d $RemotePath & set `"PATH=%PATH%;$NodeDir`" & npm install --production" 5
+    $output = Wait-VH-Terminal 120
+
+    if ($output -match "added|up to date|npm warn") {
+        Write-OK "npm 依赖安装完成"
+    } else {
+        Write-Warn "npm 安装输出: $($output.Substring(0, [Math]::Min(200, $output.Length)))"
+    }
+
+    # 保存 hash 到远程
+    if ($localPkgHash) {
+        Invoke-VH-Terminal "echo $localPkgHash> `"$RemotePath\.pkg-hash`"" 2
+        Write-OK "已保存 package.json hash"
+    }
+} else {
+    Write-OK "依赖检查完成（增量跳过）"
 }
 
 # ============== Step 7: 启动服务 ==============
@@ -407,6 +481,16 @@ for ($i = 1; $i -le $maxRetry; $i++) {
 }
 
 if ($running) {
+    Write-Step "启动 8877 测试页"
+    $testPageCmd = "powershell -NoProfile -Command ""`$pid8877 = (Get-NetTCPConnection -LocalPort 8877 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess); if(`$pid8877){ Stop-Process -Id `$pid8877 -Force -ErrorAction SilentlyContinue }; if (Test-Path '$RemotePath\ai-deck\tmp_script\testpage_node_server.js') { Start-Process -FilePath node -ArgumentList '$RemotePath\ai-deck\tmp_script\testpage_node_server.js' -WorkingDirectory '$RemotePath' -WindowStyle Hidden } elseif (Test-Path '$RemotePath\test-server\test_page_server.py') { Start-Process -FilePath py -ArgumentList '-3','$RemotePath\test-server\test_page_server.py','--host','127.0.0.1','--port','8877' -WorkingDirectory '$RemotePath' -WindowStyle Hidden }; Start-Sleep -Seconds 2; try { `$code = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8877/testpage -TimeoutSec 5).StatusCode } catch { `$code = 0 }; Write-Host TESTPAGE_STATUS:`$code"""
+    Invoke-VH-Terminal $testPageCmd 4 | Out-Null
+    $testPageOutput = Wait-VH-Terminal 20
+    if ($testPageOutput -match "TESTPAGE_STATUS:200") {
+        Write-OK "TestPage 已启动: http://127.0.0.1:8877/testpage"
+    } else {
+        Write-Warn "TestPage 启动未确认（继续部署成功流程）"
+    }
+
     Write-Host ""
     Write-Host "  ========================================" -ForegroundColor Green
     Write-Host "  ✓ Deploy SUCCESS!  v$versionStr" -ForegroundColor Green

@@ -2,14 +2,20 @@ const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
 const config = require('./config');
-const { browserApi } = require('./auth');
+const { browserApi, userApi } = require('./auth');
 const logger = require('./logger');
+const streamService = require('./stream-service');
+const { isUrlAllowedForUser } = require('./domain-policy');
 
 class BrowserManager {
   constructor() {
     this.browsers = new Map();        // browserId -> Browser instance
     this.userSessions = new Map();    // `${browserId}_${userId}` -> session object
     this.eventListeners = new Map();  // `${browserId}_${userId}` -> callback
+    this.cursorStates = new Map();    // browserId -> cursor state
+    this.browserLastActive = new Map(); // browserId -> timestamp(ms)
+    this.noOpenerSuppressionUntil = new Map(); // browserId -> timestamp(ms)
+    this.tabIdSeq = 0;
 
     // 自动重启状态
     this.restartState = new Map();    // browserId -> { retries, lastCrash, timer, stableTimer }
@@ -331,6 +337,7 @@ class BrowserManager {
 
   async launchBrowser(browserId) {
     if (this.browsers.has(browserId)) {
+      this.touchBrowser(browserId);
       return this.browsers.get(browserId);
     }
 
@@ -345,6 +352,7 @@ class BrowserManager {
     logger.info(browserId, 'Launching browser', { profilePath });
 
     try {
+      const executableExists = !!(config.puppeteer.executablePath && fs.existsSync(config.puppeteer.executablePath));
       const browser = await puppeteer.launch({
         headless: config.puppeteer.headless,
         executablePath: config.puppeteer.executablePath,
@@ -364,7 +372,18 @@ class BrowserManager {
         this._handleBrowserDisconnect(browserId);
       });
 
+      // 捕获中键后台开页等非 popup 场景，保持 tab 列表同步
+      browser.on('targetcreated', async (target) => {
+        try {
+          await this._handleTargetCreated(browserId, target);
+        } catch (e) {
+          logger.warn(browserId, `targetcreated handler failed: ${e.message}`);
+        }
+      });
+
       this.browsers.set(browserId, browser);
+      this.touchBrowser(browserId);
+      await this._ensureWarmupStream(browserId, browser);
 
       // 标记启动成功，设置稳定计时器
       this._onBrowserStarted(browserId);
@@ -372,8 +391,41 @@ class BrowserManager {
       logger.info(browserId, 'Browser launched successfully');
       return browser;
     } catch (e) {
-      logger.error(browserId, 'Browser launch failed', e.message);
-      throw e;
+      const details = {
+        message: e.message,
+        stack: e.stack,
+        executablePath: config.puppeteer.executablePath,
+        executableExists: !!(config.puppeteer.executablePath && fs.existsSync(config.puppeteer.executablePath)),
+        headless: config.puppeteer.headless,
+        profilePath
+      };
+      logger.error(browserId, 'Browser launch failed', details);
+      const err = new Error(
+        `Failed to launch browser process. executablePath="${details.executablePath}", ` +
+        `executableExists=${details.executableExists}, profilePath="${profilePath}". ` +
+        `Original: ${e.message}`
+      );
+      err.cause = e;
+      throw err;
+    }
+  }
+
+  async _ensureWarmupStream(browserId, browser) {
+    try {
+      const pages = await browser.pages();
+      let page = pages[0];
+      if (!page) {
+        page = await browser.newPage();
+        await page.setViewport({
+          width: config.stream.viewportWidth,
+          height: config.stream.viewportHeight
+        });
+        await this._setupAntiDetection(page);
+      }
+      streamService.ensureWarmupSession(browserId, page);
+      logger.info(browserId, 'Warmup stream ensured');
+    } catch (e) {
+      logger.warn(browserId, `Failed to ensure warmup stream: ${e.message}`);
     }
   }
 
@@ -439,20 +491,22 @@ class BrowserManager {
     // 收集受影响的用户会话
     const affectedSessions = [];
     for (const [key, session] of this.userSessions.entries()) {
-      if (key.startsWith(`${browserId}_`)) {
+      if (this._isBrowserSessionKey(key, browserId)) {
         affectedSessions.push(key);
-        // 通知客户端浏览器崩溃
-        this._emitEvent(key, {
-          type: 'browser_crashed',
-          message: 'Browser process disconnected, attempting auto-restart...'
-        });
       }
     }
+
+    // 通知客户端浏览器崩溃
+    this._emitEventForBrowser(browserId, {
+      type: 'browser_crashed',
+      message: 'Browser process disconnected, attempting auto-restart...'
+    });
 
     // 清理会话
     for (const key of affectedSessions) {
       this.userSessions.delete(key);
     }
+    this._cleanupBrowserRuntimeData(browserId);
 
     // 尝试自动重启
     if (config.autoRestart.enabled) {
@@ -474,12 +528,10 @@ class BrowserManager {
     if (state.retries > config.autoRestart.maxRetries) {
       logger.crash(browserId, `Consecutive crashes (${state.retries}) exceeded limit (${config.autoRestart.maxRetries}), stopping auto-restart`);
       // 通知所有受影响的客户端
-      for (const key of affectedSessionKeys) {
-        this._emitEvent(key, {
-          type: 'browser_restart_failed',
-          message: `Browser stopped auto-restarting after multiple crashes. Please contact admin.`
-        });
-      }
+      this._emitEventForBrowser(browserId, {
+        type: 'browser_restart_failed',
+        message: `Browser stopped auto-restarting after multiple crashes. Please contact admin.`
+      });
       return;
     }
 
@@ -502,19 +554,11 @@ class BrowserManager {
 
         const browser = await this.launchBrowser(browserId);
 
-        // 尝试恢复受影响的用户会话
-        for (const key of affectedSessionKeys) {
-          const callback = this.eventListeners.get(key);
-          if (callback) {
-            // 通知客户端浏览器已恢复
-            try {
-              callback({
-                type: 'browser_restarted',
-                message: 'Browser auto-restarted, please refresh the page to reconnect.'
-              });
-            } catch (e) {}
-          }
-        }
+        // 通知所有受影响的客户端浏览器已恢复
+        this._emitEventForBrowser(browserId, {
+          type: 'browser_restarted',
+          message: 'Browser auto-restarted, please refresh the page to reconnect.'
+        });
 
         logger.info(browserId, 'Auto-restart successful');
       } catch (e) {
@@ -546,8 +590,21 @@ class BrowserManager {
     if (this.healthCheckTimer) return;
 
     this.healthCheckTimer = setInterval(async () => {
+      if (config.browserDaemon && config.browserDaemon.enabled) {
+        await this.ensureDaemonBrowsers();
+      }
       for (const [browserId, browser] of this.browsers.entries()) {
         try {
+          // 无活跃会话时按空闲超时回收浏览器实例
+          const hasSession = this.hasSessionsForBrowser(browserId);
+          const lastActive = this.browserLastActive.get(browserId) || 0;
+          const daemonEnabled = !!(config.browserDaemon && config.browserDaemon.enabled);
+          if (!daemonEnabled && config.idleClose.enabled && !hasSession && Date.now() - lastActive > config.idleClose.timeoutMs) {
+            logger.info(browserId, `Idle timeout reached (${config.idleClose.timeoutMs}ms), closing browser`);
+            await this.closeBrowser(browserId);
+            continue;
+          }
+
           if (!browser.isConnected()) {
             logger.warn(browserId, 'Health check: browser disconnected');
             this._handleBrowserDisconnect(browserId);
@@ -578,21 +635,76 @@ class BrowserManager {
 
   // ============== 用户会话管理（多 Tab） ==============
 
+  // Per-user session key – each user always gets their own tab space
+  _getSessionKey(browserId, userId) {
+    return `${browserId}_${userId}`;
+  }
+
+  _isBrowserSessionKey(key, browserId) {
+    return key.startsWith(`${browserId}_`);
+  }
+
+  _extractBrowserIdFromSessionKey(key) {
+    const idx = key.indexOf('_');
+    return idx === -1 ? key : key.slice(0, idx);
+  }
+
+  _extractUserIdFromSessionKey(key) {
+    const idx = key.indexOf('_');
+    return idx === -1 ? '' : key.slice(idx + 1);
+  }
+
+  _cleanupSessionTabs(session) {
+    if (!session || !Array.isArray(session.tabs)) return;
+    const seenPages = new Set();
+    const seenTargetIds = new Set();
+    const nextTabs = [];
+    for (const tab of session.tabs) {
+      if (!tab || !tab.page) continue;
+      try {
+        if (tab.page.isClosed && tab.page.isClosed()) continue;
+      } catch (_) {}
+      const targetId = String(this._safeTargetIdForPage(tab.page) || tab.targetId || '');
+      if (targetId) {
+        if (seenTargetIds.has(targetId)) continue;
+        seenTargetIds.add(targetId);
+      } else {
+        if (seenPages.has(tab.page)) continue;
+        seenPages.add(tab.page);
+      }
+      tab.targetId = targetId;
+      nextTabs.push(tab);
+    }
+    session.tabs = nextTabs;
+    if (session.tabs.length === 0) {
+      session.activeIndex = 0;
+      return;
+    }
+    if (session.activeIndex < 0 || session.activeIndex >= session.tabs.length) {
+      session.activeIndex = Math.min(Math.max(0, session.activeIndex), session.tabs.length - 1);
+    }
+  }
+
   async getSessionForUser(browserId, userId) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
 
     if (this.userSessions.has(key)) {
       const session = this.userSessions.get(key);
+      if (session.users) session.users.add(String(userId));
       // 验证至少有一个可用的 tab
       if (session.tabs.length > 0) {
         try {
           await session.tabs[session.activeIndex].page.evaluate(() => true);
+          this.touchBrowser(browserId);
+          streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
           return session;
         } catch (e) {
           // 活跃页面无效，移除它
           session.tabs.splice(session.activeIndex, 1);
           if (session.tabs.length > 0) {
             session.activeIndex = Math.min(session.activeIndex, session.tabs.length - 1);
+            this.touchBrowser(browserId);
+            streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
             return session;
           }
           this.userSessions.delete(key);
@@ -607,22 +719,28 @@ class BrowserManager {
     if (!browser) {
       browser = await this.launchBrowser(browserId);
     }
+    this.touchBrowser(browserId);
 
     const browserConfig = browserApi.getById(browserId);
 
     const session = {
+      browserId,
+      userId: String(userId),
       tabs: [],
       activeIndex: 0,
-      clipboard: ''  // 虚拟剪贴板（per-session，不污染系统剪贴板）
+      clipboard: '',  // 虚拟剪贴板（per-session，不污染系统剪贴板）
+      creatingTab: false,
+      users: new Set([String(userId)])
     };
 
     this.userSessions.set(key, session);
 
-    // 尝试复用 browser 的现有空白页，否则创建新页面
+    // 尝试复用 browser 的现有空白页（仅当未被其他 session 占用时），否则创建新页面
     let page;
     const existingPages = await browser.pages();
-    if (existingPages.length > 0 && existingPages[0].url() === 'about:blank') {
-      page = existingPages[0];
+    const reuseCandidate = existingPages.find(p => p.url() === 'about:blank' && !p.__sharedTracked);
+    if (reuseCandidate) {
+      page = reuseCandidate;
       await page.setViewport({
         width: config.stream.viewportWidth,
         height: config.stream.viewportHeight
@@ -641,15 +759,30 @@ class BrowserManager {
     // 添加第一个 tab
     this._addTabToSession(key, session, page);
 
-    // 导航到默认 URL
+    // 导航到默认 URL（异步，不阻塞首帧）
     if (browserConfig && browserConfig.url) {
-      try {
-        await page.goto(browserConfig.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        session.tabs[0].title = await page.title().catch(() => 'New Tab');
-        session.tabs[0].url = page.url();
-        logger.info(browserId, `User ${userId} navigated to ${browserConfig.url}`);
-      } catch (e) {
-        logger.warn(browserId, `Navigation failed: ${e.message}`);
+      const user = this._resolveUserForTabOwner(userId);
+      const check = isUrlAllowedForUser(browserConfig.url, browserConfig, user);
+      if (check.allowed) {
+        if (session.tabs[0]) session.tabs[0].url = browserConfig.url;
+        page.goto(browserConfig.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+          .then(async () => {
+            const firstTab = session.tabs[0];
+            if (!firstTab || firstTab.page !== page) return;
+            firstTab.title = await page.title().catch(() => 'New Tab');
+            firstTab.url = page.url();
+            this._emitTabsUpdated(key);
+            logger.info(browserId, `User ${userId} navigated to ${browserConfig.url}`);
+          })
+          .catch((e) => {
+            logger.warn(browserId, `Navigation failed: ${e.message}`);
+          });
+      } else {
+        this._emitEvent(key, {
+          type: 'domain_blocked',
+          blockedUrl: browserConfig.url,
+          allowedDomains: browserConfig?.domainRestrictions || []
+        });
       }
     }
 
@@ -664,41 +797,327 @@ class BrowserManager {
   }
 
   // 获取活跃页面（同步版本，不创建新会话）
+  getSession(browserId, userId) {
+    const key = this._getSessionKey(browserId, userId);
+    return this.userSessions.get(key) || null;
+  }
+
   getActivePage(browserId, userId) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || session.tabs.length === 0) return null;
+    this.touchBrowser(browserId);
+    streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
     return session.tabs[session.activeIndex].page;
+  }
+
+  async getAnyPage(browserId) {
+    // 优先返回活跃会话页面
+    for (const [key, session] of this.userSessions.entries()) {
+      if (!this._isBrowserSessionKey(key, browserId)) continue;
+      if (session.tabs.length > 0) {
+        this.touchBrowser(browserId);
+        streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
+        return session.tabs[session.activeIndex].page;
+      }
+    }
+
+    // 没有会话时，尝试返回浏览器已有页面
+    const browser = this.browsers.get(browserId);
+    if (!browser) return null;
+    const pages = await browser.pages();
+    if (pages.length === 0) return null;
+    this.touchBrowser(browserId);
+    streamService.ensureWarmupSession(browserId, pages[0]);
+    return pages[0];
+  }
+
+  _findSessionByPage(browserId, page) {
+    for (const [key, session] of this.userSessions.entries()) {
+      if (!this._isBrowserSessionKey(key, browserId)) continue;
+      const idx = session.tabs.findIndex((tab) => tab.page === page);
+      if (idx !== -1) return { key, session, tabIndex: idx };
+    }
+    return null;
+  }
+
+  async _handleTargetCreated(browserId, target) {
+    if (!target || target.type() !== 'page') return;
+    const newPage = await target.page();
+    if (!newPage || newPage.__sharedTracked) return;
+    if (newPage.isClosed && newPage.isClosed()) return;
+    let initialUrl = '';
+    try {
+      initialUrl = newPage.url() || '';
+    } catch (_) {}
+
+    const openerTarget = target.opener();
+    if (!openerTarget || openerTarget.type() !== 'page') {
+      if (initialUrl === 'about:blank') {
+        // Some middle-click/new-window flows are created as about:blank first.
+        // Wait briefly for URL stabilization before deciding to ignore.
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        if (newPage.isClosed && newPage.isClosed()) return;
+        try {
+          initialUrl = newPage.url() || '';
+        } catch (_) {
+          initialUrl = '';
+        }
+        if (initialUrl === 'about:blank') return;
+      }
+      const suppressUntil = this.noOpenerSuppressionUntil.get(browserId) || 0;
+      if (Date.now() < suppressUntil) {
+        // Ignore transient no-opener targets right after programmatic new tab creation.
+        logger.info(browserId, 'Ignored no-opener target during suppression window');
+        return;
+      }
+      // 部分 middle click/新窗口场景可能没有 opener，若该浏览器仅一个会话则归属该会话
+      const sessions = [];
+      for (const [key, session] of this.userSessions.entries()) {
+        if (this._isBrowserSessionKey(key, browserId)) sessions.push({ key, session });
+      }
+      if (sessions.length === 1) {
+        const { key, session } = sessions[0];
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        if (newPage.isClosed && newPage.isClosed()) return;
+        let stableUrl = '';
+        try {
+          stableUrl = newPage.url() || '';
+        } catch (_) {}
+        if (!stableUrl || stableUrl === 'about:blank') {
+          logger.info(browserId, 'Ignored no-opener target without stable URL');
+          return;
+        }
+        const activeTab = session.tabs[session.activeIndex];
+        const activeUrl = activeTab && activeTab.url ? activeTab.url : '';
+        // Do not drop same-URL tabs: middle-click/open-in-new-tab may legitimately
+        // create a background tab with URL identical to the active tab.
+        if (activeUrl && stableUrl === activeUrl) {
+          logger.info(browserId, 'No-opener target has same URL as active tab; keep and sync', {
+            stableUrl
+          });
+        }
+        try {
+          await newPage.setViewport({
+            width: config.stream.viewportWidth,
+            height: config.stream.viewportHeight
+          });
+          await this._setupAntiDetection(newPage);
+        } catch (e) {}
+        this._addTabToSession(key, session, newPage);
+        this._emitTabsUpdated(key);
+        logger.info(browserId, 'Background tab (no opener) synced to single session', {
+          targetUrl: newPage.url(),
+          tabCount: session.tabs.length
+        });
+      }
+      return;
+    }
+
+    let openerPage = null;
+    try {
+      openerPage = await openerTarget.page();
+    } catch (e) {
+      return;
+    }
+    if (!openerPage) return;
+
+    const match = this._findSessionByPage(browserId, openerPage);
+    if (!match) return;
+
+    // Delay briefly to filter out short-lived ad/tracker popups that close immediately.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    if (newPage.isClosed && newPage.isClosed()) return;
+
+    if (initialUrl === 'about:blank') {
+      try {
+        await Promise.race([
+          newPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 2500 }),
+          new Promise((resolve) => setTimeout(resolve, 2500))
+        ]);
+      } catch (_) {}
+      if (newPage.isClosed && newPage.isClosed()) return;
+      try {
+        if ((newPage.url() || '') === 'about:blank') return;
+      } catch (_) {}
+    }
+
+    try {
+      await newPage.setViewport({
+        width: config.stream.viewportWidth,
+        height: config.stream.viewportHeight
+      });
+      await this._setupAntiDetection(newPage);
+    } catch (e) {}
+
+    this._addTabToSession(match.key, match.session, newPage);
+    this._emitTabsUpdated(match.key);
+    logger.info(browserId, 'Background tab detected and synced', {
+      targetUrl: newPage.url(),
+      tabCount: match.session.tabs.length
+    });
+  }
+
+  _resolveUserForTabOwner(ownerUserId) {
+    const user = userApi.getById(String(ownerUserId || ''));
+    return user || { id: String(ownerUserId || ''), isAdmin: false };
+  }
+
+  async _enforceDomainRestriction(browserId, key, tab, page, url) {
+    const browserConfig = browserApi.getById(browserId);
+    const user = this._resolveUserForTabOwner(tab?.owner);
+    const check = isUrlAllowedForUser(url, browserConfig, user);
+    if (check.allowed || url === 'about:blank') return true;
+
+    logger.warn(browserId, 'Blocked navigation by domain policy', {
+      userId: user.id,
+      url,
+      allowedDomains: browserConfig?.domainRestrictions || []
+    });
+    this._emitEvent(key, {
+      type: 'domain_blocked',
+      blockedUrl: url,
+      allowedDomains: browserConfig?.domainRestrictions || []
+    });
+    try {
+      await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 });
+    } catch (_) {}
+    tab.url = 'about:blank';
+    tab.title = 'Blocked by domain policy';
+    tab.isReady = true;
+    return false;
   }
 
   // ============== Tab 管理 ==============
 
   _addTabToSession(key, session, page) {
+    if (page.__sharedTracked) {
+      return session.tabs.findIndex((tab) => tab.page === page);
+    }
+    page.__sharedTracked = true;
+    page.__sharedSessionKey = key;
+    const browserId = this._extractBrowserIdFromSessionKey(key);
+    const tabIdentifier = `${browserId}_${Date.now()}_${++this.tabIdSeq}`;
+
+    const ownerUserId = this._extractUserIdFromSessionKey(key);
     const tab = {
       page,
       title: 'New Tab',
       url: page.url() || 'about:blank',
-      pendingDialog: null
+      targetId: String(this._safeTargetIdForPage(page) || ''),
+      isReady: (page.url() || 'about:blank') === 'about:blank',
+      openedAt: Date.now(),
+      pendingDialog: null,
+      tabIdentifier,
+      tab_identifier: tabIdentifier,
+      owner: ownerUserId,          // user who owns this tab
+      commandLog: []               // last N commands: { who, type, detail, ts }
     };
     session.tabs.push(tab);
-
-    // 解析 browserId 用于日志
-    const browserId = key.split('_')[0];
+    let navDebounceTimer = null;
+    let readyDebounceTimer = null;
+    let readyFallbackTimer = null;
+    const emitTabsUpdatedDebounced = (delayMs = 120) => {
+      if (readyDebounceTimer) clearTimeout(readyDebounceTimer);
+      readyDebounceTimer = setTimeout(() => {
+        readyDebounceTimer = null;
+        this._emitTabsUpdated(key);
+      }, delayMs);
+    };
 
     // 监听页面导航，更新 title 和 url
     page.on('framenavigated', async (frame) => {
-      if (frame === page.mainFrame()) {
+      if (frame !== page.mainFrame()) return;
+      if (navDebounceTimer) clearTimeout(navDebounceTimer);
+      navDebounceTimer = setTimeout(async () => {
+        navDebounceTimer = null;
         try {
           tab.url = page.url();
+          const allowed = await this._enforceDomainRestriction(browserId, key, tab, page, tab.url);
+          if (!allowed) {
+            this._emitTabsUpdated(key);
+            return;
+          }
+          tab.isReady = false;
           tab.title = await page.title() || tab.url;
+          // Fallback: some popup/new-tab flows do not fire load reliably.
+          if (readyFallbackTimer) clearTimeout(readyFallbackTimer);
+          readyFallbackTimer = setTimeout(() => {
+            readyFallbackTimer = null;
+            if (tab.isReady === false) {
+              tab.isReady = true;
+              this._emitTabsUpdated(key);
+              logger.info(browserId, 'Tab ready fallback promoted', {
+                tabIdentifier: tab.tabIdentifier,
+                url: tab.url
+              });
+            }
+          }, 1800);
         } catch (e) {}
         this._emitTabsUpdated(key);
+      }, 160);
+    });
+
+    page.on('domcontentloaded', () => {
+      tab.isReady = true;
+      if (readyFallbackTimer) {
+        clearTimeout(readyFallbackTimer);
+        readyFallbackTimer = null;
       }
+      emitTabsUpdatedDebounced(120);
+    });
+
+    page.on('load', () => {
+      tab.isReady = true;
+      if (readyFallbackTimer) {
+        clearTimeout(readyFallbackTimer);
+        readyFallbackTimer = null;
+      }
+      emitTabsUpdatedDebounced(120);
     });
 
     // 监听弹出窗口（window.open, target="_blank"）
     page.on('popup', async (newPage) => {
-      logger.info(browserId, `New popup opened`);
+      if (!newPage || (newPage.isClosed && newPage.isClosed())) return;
+      // Delay sync to avoid UI flicker from transient popup targets.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (newPage.isClosed && newPage.isClosed()) return;
+      let popupUrl = '';
+      try {
+        popupUrl = newPage.url() || '';
+      } catch (_) {}
+      if (popupUrl === 'about:blank') {
+        try {
+          await Promise.race([
+            newPage.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 1000 }),
+            new Promise((resolve) => setTimeout(resolve, 1000))
+          ]);
+        } catch (_) {}
+        if (newPage.isClosed && newPage.isClosed()) return;
+        try {
+          popupUrl = newPage.url() || '';
+        } catch (_) {}
+        if (popupUrl === 'about:blank') {
+          logger.info(browserId, 'Ignored popup target that remained about:blank', {
+            openerUrl: page.url()
+          });
+          return;
+        }
+      }
+      logger.info(browserId, 'New popup opened', {
+        openerUrl: page.url(),
+        popupUrl
+      });
+      const openerUrl = (() => {
+        try { return page.url() || ''; } catch (_) { return ''; }
+      })();
+      if (popupUrl && openerUrl && popupUrl === openerUrl) {
+        logger.info(browserId, 'Ignored popup same as opener URL', {
+          openerUrl,
+          popupUrl
+        });
+        return;
+      }
       try {
         await newPage.setViewport({
           width: config.stream.viewportWidth,
@@ -707,11 +1126,10 @@ class BrowserManager {
         // 为新页面注入反检测脚本
         await this._setupAntiDetection(newPage);
       } catch (e) {}
-      this._addTabToSession(key, session, newPage);
-      // 自动切换到新 tab
-      session.activeIndex = session.tabs.length - 1;
+      const exists = session.tabs.find((t) => t.page === newPage);
+      if (!exists) this._addTabToSession(key, session, newPage);
+      // 保持当前标签为活跃，弹出页默认作为后台标签
       this._emitTabsUpdated(key);
-      this._emitTabSwitched(key, session.activeIndex);
     });
 
     // 监听 JS 对话框（alert/confirm/prompt）
@@ -719,13 +1137,14 @@ class BrowserManager {
       logger.info(browserId, `Dialog: ${dialog.type()} - ${dialog.message()}`);
       const tabIndex = session.tabs.findIndex(t => t.page === page);
       tab.pendingDialog = dialog;
-      this._emitEvent(key, {
+      const dialogEvent = {
         type: 'dialog_opened',
         tabIndex,
         dialogType: dialog.type(),
         message: dialog.message(),
         defaultValue: dialog.defaultValue()
-      });
+      };
+      this._emitEvent(key, dialogEvent);
       this._emitTabsUpdated(key);
     });
 
@@ -742,8 +1161,30 @@ class BrowserManager {
       }
     });
 
+    page.on('requestfailed', (request) => {
+      if (request.resourceType() !== 'document') return;
+      const failure = request.failure();
+      logger.warn(browserId, 'Document request failed', {
+        url: request.url(),
+        method: request.method(),
+        reason: failure ? failure.errorText : 'unknown'
+      });
+    });
+
     // 监听页面关闭
     page.on('close', () => {
+      if (navDebounceTimer) {
+        clearTimeout(navDebounceTimer);
+        navDebounceTimer = null;
+      }
+      if (readyDebounceTimer) {
+        clearTimeout(readyDebounceTimer);
+        readyDebounceTimer = null;
+      }
+      if (readyFallbackTimer) {
+        clearTimeout(readyFallbackTimer);
+        readyFallbackTimer = null;
+      }
       const idx = session.tabs.findIndex(t => t.page === page);
       if (idx !== -1) {
         session.tabs.splice(idx, 1);
@@ -765,76 +1206,148 @@ class BrowserManager {
   }
 
   getTabList(browserId, userId) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session) return { tabs: [], activeIndex: 0 };
+    this._cleanupSessionTabs(session);
+    const streamReady = this._isSessionStreamReady(browserId, userId, session);
+    const activeIndex = Math.min(
+      Math.max(0, Number(session.activeIndex || 0)),
+      Math.max(0, (session.tabs || []).length - 1)
+    );
 
     return {
       tabs: session.tabs.map((tab, index) => ({
         index,
         title: tab.title || 'New Tab',
         url: tab.url || 'about:blank',
-        hasDialog: !!tab.pendingDialog
+        targetId: String(tab.targetId || this._safeTargetIdForPage(tab.page) || ''),
+        isReady: this._resolveTabReadyState(tab, index, activeIndex, streamReady),
+        hasDialog: !!tab.pendingDialog,
+        tabIdentifier: tab.tabIdentifier,
+        tab_identifier: tab.tab_identifier || tab.tabIdentifier,
+        owner: tab.owner || userId
       })),
-      activeIndex: session.activeIndex
+      activeIndex,
+      creatingTab: !!session.creatingTab
     };
   }
 
+  async refreshTabMeta(browserId, userId) {
+    const key = this._getSessionKey(browserId, userId);
+    const session = this.userSessions.get(key);
+    if (!session) return;
+    await this._refreshSessionTabMeta(session);
+  }
+
+  async _refreshSessionTabMeta(session) {
+    for (const tab of session.tabs) {
+      try {
+        tab.url = tab.page.url() || tab.url || 'about:blank';
+        const title = await tab.page.title();
+        if (title) tab.title = title;
+      } catch (e) {
+        // Ignore tab metadata refresh failures on closing tabs
+      }
+    }
+  }
+
   async switchTab(browserId, userId, tabIndex) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || tabIndex < 0 || tabIndex >= session.tabs.length) return null;
 
     session.activeIndex = tabIndex;
     const page = session.tabs[tabIndex].page;
 
-    try {
-      await page.bringToFront();
-    } catch (e) {}
-
     this._emitTabSwitched(key, tabIndex);
+    this.touchBrowser(browserId);
+    streamService.ensureWarmupSession(browserId, page);
+    // 不阻塞切换主流程，避免 bringToFront 慢时卡住流/控制链路。
+    const bringToFrontStartedAt = Date.now();
+    page.bringToFront()
+      .then(() => {
+        const elapsedMs = Date.now() - bringToFrontStartedAt;
+        if (elapsedMs > 600) {
+          logger.info(browserId, 'bringToFront slow on tab switch', {
+            userId,
+            tabIndex,
+            elapsedMs
+          });
+        }
+      })
+      .catch(() => {});
     return page;
   }
 
   async createNewTab(browserId, userId, url) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session) return null;
 
     const browser = this.browsers.get(browserId);
     if (!browser) return null;
 
-    const page = await browser.newPage();
-    await page.setViewport({
-      width: config.stream.viewportWidth,
-      height: config.stream.viewportHeight
-    });
-
-    // 为新标签页注入反检测脚本
-    await this._setupAntiDetection(page);
-
-    this._addTabToSession(key, session, page);
-    session.activeIndex = session.tabs.length - 1;
-
-    if (url) {
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        const tab = session.tabs[session.activeIndex];
-        tab.title = await page.title().catch(() => 'New Tab');
-        tab.url = page.url();
-      } catch (e) {
-        logger.warn(browserId, `New tab navigation failed: ${e.message}`);
-      }
-    }
-
-    logger.info(browserId, `User ${userId} created new tab`);
+    const beginAt = Date.now();
+    session.creatingTab = true;
     this._emitTabsUpdated(key);
-    this._emitTabSwitched(key, session.activeIndex);
-    return page;
+    try {
+      this.noOpenerSuppressionUntil.set(browserId, Date.now() + 1200);
+      const page = await browser.newPage();
+      await page.setViewport({
+        width: config.stream.viewportWidth,
+        height: config.stream.viewportHeight
+      });
+
+      // 为新标签页注入反检测脚本
+      await this._setupAntiDetection(page);
+
+      this._addTabToSession(key, session, page);
+      session.activeIndex = session.tabs.length - 1;
+      // Immediate feedback: new tab appears first as not-ready.
+      this._emitTabsUpdated(key);
+      this._emitTabSwitched(key, session.activeIndex);
+
+      if (url) {
+        try {
+          const browserConfig = browserApi.getById(browserId);
+          const user = this._resolveUserForTabOwner(userId);
+          const check = isUrlAllowedForUser(url, browserConfig, user);
+          if (check.allowed) {
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            const tab = session.tabs[session.activeIndex];
+            tab.title = await page.title().catch(() => 'New Tab');
+            tab.url = page.url();
+            tab.isReady = true;
+          } else {
+            this._emitEvent(key, {
+              type: 'domain_blocked',
+              blockedUrl: url,
+              allowedDomains: browserConfig?.domainRestrictions || []
+            });
+          }
+        } catch (e) {
+          logger.warn(browserId, `New tab navigation failed: ${e.message}`);
+        }
+      }
+
+      logger.info(browserId, `User ${userId} created new tab`, {
+        elapsedMs: Date.now() - beginAt,
+        tabCount: session.tabs.length
+      });
+      this._emitTabsUpdated(key);
+      this._emitTabSwitched(key, session.activeIndex);
+      this.touchBrowser(browserId);
+      streamService.ensureWarmupSession(browserId, page);
+      return page;
+    } finally {
+      session.creatingTab = false;
+      this._emitTabsUpdated(key);
+    }
   }
 
   async closeTab(browserId, userId, tabIndex) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || tabIndex < 0 || tabIndex >= session.tabs.length) return;
 
@@ -846,6 +1359,7 @@ class BrowserManager {
         session.tabs[0].url = 'about:blank';
       } catch (e) {}
       this._emitTabsUpdated(key);
+      streamService.ensureWarmupSession(browserId, session.tabs[0].page);
       return;
     }
 
@@ -864,17 +1378,21 @@ class BrowserManager {
     // 先发送事件，再关闭页面
     this._emitTabsUpdated(key);
     this._emitTabSwitched(key, session.activeIndex);
+    if (session.tabs[session.activeIndex]) {
+      streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
+    }
 
     // 最后关闭页面（close 事件中 findIndex 会返回 -1，不会重复处理）
     try {
       await tab.page.close();
     } catch (e) {}
+    this.touchBrowser(browserId);
   }
 
   // ============== 对话框处理 ==============
 
   async respondToDialog(browserId, userId, tabIndex, accept, promptText) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || tabIndex < 0 || tabIndex >= session.tabs.length) return;
 
@@ -902,7 +1420,7 @@ class BrowserManager {
   // ============== 虚拟剪贴板 ==============
 
   async copySelection(browserId, userId) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || session.tabs.length === 0) return '';
 
@@ -918,7 +1436,7 @@ class BrowserManager {
   }
 
   async pasteText(browserId, userId, text) {
-    const key = `${browserId}_${userId}`;
+    const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
     if (!session || session.tabs.length === 0) return;
 
@@ -982,30 +1500,178 @@ class BrowserManager {
     }
   }
 
+  _emitEventForBrowser(browserId, event) {
+    for (const [key, callback] of this.eventListeners.entries()) {
+      if (!this._isBrowserSessionKey(key, browserId)) continue;
+      try {
+        callback(event);
+      } catch (e) {
+        console.error('[BrowserManager] Browser event callback error:', e.message);
+      }
+    }
+  }
+
   _emitTabsUpdated(key) {
     const session = this.userSessions.get(key);
     if (!session) return;
+    this._cleanupSessionTabs(session);
+    const browserId = this._extractBrowserIdFromSessionKey(key);
+    const userId = this._extractUserIdFromSessionKey(key);
+    const streamReady = this._isSessionStreamReady(browserId, userId, session);
+    const activeIndex = Math.min(
+      Math.max(0, Number(session.activeIndex || 0)),
+      Math.max(0, (session.tabs || []).length - 1)
+    );
 
-    this._emitEvent(key, {
+    const payload = {
       type: 'tabs_updated',
       tabs: session.tabs.map((tab, index) => ({
         index,
         title: tab.title || 'New Tab',
         url: tab.url || 'about:blank',
-        hasDialog: !!tab.pendingDialog
+        isReady: this._resolveTabReadyState(tab, index, activeIndex, streamReady),
+        hasDialog: !!tab.pendingDialog,
+        tabIdentifier: tab.tabIdentifier,
+        tab_identifier: tab.tab_identifier || tab.tabIdentifier
       })),
-      activeIndex: session.activeIndex
-    });
+      activeIndex
+    };
+
+    this._emitEvent(key, payload);
   }
 
   _emitTabSwitched(key, activeIndex) {
-    this._emitEvent(key, {
+    const payload = {
       type: 'tab_switched',
       activeIndex
+    };
+    this._emitEvent(key, payload);
+  }
+
+  // ============== Tab command log (per-tab recent ops) ==============
+
+  logTabCommand(browserId, userId, type, detail) {
+    const session = this.getSession(browserId, userId);
+    if (!session || session.tabs.length === 0) return;
+    const tab = session.tabs[session.activeIndex];
+    if (!tab) return;
+    if (!tab.commandLog) tab.commandLog = [];
+    tab.commandLog.unshift({
+      who: String(userId),
+      type: type,
+      detail: detail || '',
+      ts: new Date().toISOString()
     });
+    if (tab.commandLog.length > 2) tab.commandLog.length = 2;
+  }
+
+  // Get all tabs across all user sessions for a given browser (used by report)
+  getAllTabsForBrowser(browserId) {
+    const tabs = [];
+    for (const [key, session] of this.userSessions.entries()) {
+      if (!this._isBrowserSessionKey(key, browserId)) continue;
+      const userId = this._extractUserIdFromSessionKey(key);
+      this._cleanupSessionTabs(session);
+      const streamReady = this._isSessionStreamReady(browserId, userId, session);
+      const activeIndex = Math.min(
+        Math.max(0, Number(session.activeIndex || 0)),
+        Math.max(0, (session.tabs || []).length - 1)
+      );
+      for (let i = 0; i < session.tabs.length; i++) {
+        const tab = session.tabs[i];
+        let targetId = '';
+        let pageAlive = true;
+        try {
+          const target = tab.page && tab.page.target ? tab.page.target() : null;
+          targetId = (target && (target._targetId || target?._targetInfo?.targetId)) || '';
+          pageAlive = !(tab.page && tab.page.isClosed && tab.page.isClosed());
+        } catch (_) {
+          pageAlive = false;
+        }
+        tabs.push({
+          index: i,
+          title: tab.title || 'New Tab',
+          url: tab.url || 'about:blank',
+          isReady: this._resolveTabReadyState(tab, i, activeIndex, streamReady),
+          isActive: i === activeIndex,
+          pageAlive,
+          owner: tab.owner || userId,
+          targetId: targetId || String(tab.targetId || ''),
+          tabIdentifier: tab.tabIdentifier,
+          commandLog: (tab.commandLog || []).slice(0, 2)
+        });
+      }
+    }
+    return tabs;
+  }
+
+  // Get all user session summaries for a given browser (used by report)
+  getUserSessionsForBrowser(browserId) {
+    const users = [];
+    for (const [key, session] of this.userSessions.entries()) {
+      if (!this._isBrowserSessionKey(key, browserId)) continue;
+      const userId = this._extractUserIdFromSessionKey(key);
+      this._cleanupSessionTabs(session);
+      const activeIndex = Math.min(
+        Math.max(0, Number(session.activeIndex || 0)),
+        Math.max(0, (session.tabs || []).length - 1)
+      );
+      const activeTab = session.tabs[activeIndex] || null;
+      users.push({
+        userId,
+        sessionKey: key,
+        tabCount: session.tabs.length,
+        activeTabIndex: activeIndex,
+        activeTabTitle: activeTab ? (activeTab.title || 'New Tab') : '-',
+        activeTabUrl: activeTab ? (activeTab.url || 'about:blank') : '-'
+      });
+    }
+    return users;
+  }
+
+  updateRemoteCursor(browserId, cursor, userId) {
+    const state = {
+      x: Number(cursor.x || 0),
+      y: Number(cursor.y || 0),
+      button: cursor.button || 'none',
+      source: cursor.source || 'unknown',
+      updatedAt: Date.now()
+    };
+    this.cursorStates.set(browserId, state);
+    if (userId) {
+      // Per-user isolation: only send cursor to the user who owns it
+      const key = this._getSessionKey(browserId, userId);
+      this._emitEvent(key, { type: 'remote_cursor', ...state });
+    } else {
+      this._emitEventForBrowser(browserId, { type: 'remote_cursor', ...state });
+    }
   }
 
   // ============== 清理 ==============
+
+  async shutdownUserSession(browserId, userId) {
+    const key = this._getSessionKey(browserId, userId);
+    const session = this.userSessions.get(key);
+    if (!session) return { closedTabs: 0 };
+    logger.info(browserId, `Shutdown requested by user ${userId}`, {
+      tabCountBefore: session.tabs.length
+    });
+
+    const tabs = [...session.tabs];
+    for (const tab of tabs) {
+      try {
+        await tab.page.close();
+      } catch (e) {}
+    }
+
+    this.userSessions.delete(key);
+    this.eventListeners.delete(key);
+    this.touchBrowser(browserId);
+    logger.info(browserId, `Shutdown finished for user ${userId}`, {
+      closedTabs: tabs.length
+    });
+    return { closedTabs: tabs.length };
+  }
 
   async closeBrowser(browserId) {
     const browser = this.browsers.get(browserId);
@@ -1019,12 +1685,13 @@ class BrowserManager {
       this.browsers.delete(browserId);
       this.resetRestartState(browserId);
       for (const [key] of this.userSessions.entries()) {
-        if (key.startsWith(`${browserId}_`)) {
+        if (this._isBrowserSessionKey(key, browserId)) {
           this.userSessions.delete(key);
           this.eventListeners.delete(key);
         }
       }
     }
+    this._cleanupBrowserRuntimeData(browserId);
   }
 
   /**
@@ -1046,9 +1713,8 @@ class BrowserManager {
       const restartState = this.restartState.get(browserId);
       const sessions = [];
       for (const [key, session] of this.userSessions.entries()) {
-        if (key.startsWith(`${browserId}_`)) {
-          const parts = key.split('_');
-          const userId = parts.slice(1).join('_');
+        if (this._isBrowserSessionKey(key, browserId)) {
+          const userId = this._extractUserIdFromSessionKey(key);
           sessions.push({ userId, tabCount: session.tabs.length });
         }
       }
@@ -1066,12 +1732,170 @@ class BrowserManager {
     return status;
   }
 
+  getBrowserRuntimeMap() {
+    const map = new Map();
+    for (const [browserId, browser] of this.browsers.entries()) {
+      let pid = null;
+      let alive = false;
+      try {
+        pid = browser && browser.process ? (browser.process()?.pid || null) : null;
+        alive = !!(browser && browser.isConnected && browser.isConnected());
+      } catch (_) {}
+      map.set(browserId, { pid, alive });
+    }
+    return map;
+  }
+
+  getSessionReport() {
+    const report = [];
+    for (const [key, session] of this.userSessions.entries()) {
+      const browserId = this._extractBrowserIdFromSessionKey(key);
+      const userId = this._extractUserIdFromSessionKey(key);
+      const browser = this.browsers.get(browserId);
+      let browserPid = null;
+      let browserAlive = false;
+      try {
+        browserPid = browser && browser.process ? (browser.process()?.pid || null) : null;
+        browserAlive = !!(browser && browser.isConnected && browser.isConnected());
+      } catch (_) {}
+      this._cleanupSessionTabs(session);
+      const activeIndex = Math.min(Math.max(0, session.activeIndex || 0), Math.max(0, (session.tabs || []).length - 1));
+      const streamReady = this._isSessionStreamReady(browserId, userId, session);
+      const tabs = (session.tabs || []).map((tab, index) => ({
+        ...(() => {
+          let targetId = '';
+          let pageAlive = true;
+          try {
+            const target = tab.page && tab.page.target ? tab.page.target() : null;
+            targetId = (target && (target._targetId || target?._targetInfo?.targetId)) || '';
+            pageAlive = !(tab.page && tab.page.isClosed && tab.page.isClosed());
+          } catch (_) {
+            pageAlive = false;
+          }
+          return {
+            index,
+            title: tab.title || 'New Tab',
+            url: tab.url || 'about:blank',
+            isReady: this._resolveTabReadyState(tab, index, activeIndex, streamReady),
+            hasDialog: !!tab.pendingDialog,
+            tabIdentifier: tab.tabIdentifier || tab.tab_identifier,
+            targetId: targetId || String(tab.targetId || ''),
+            browserPid,
+            pageAlive,
+            owner: tab.owner || userId,
+            commandLog: (tab.commandLog || []).slice(0, 2)
+          };
+        })()
+      }));
+      report.push({
+        sessionKey: key,
+        browserId,
+        userId,
+        browserPid,
+        browserAlive,
+        creatingTab: !!session.creatingTab,
+        tabCount: tabs.length,
+        activeIndex,
+        activeTab: tabs[activeIndex] || null,
+        tabs,
+        users: Array.from(session.users || [])
+      });
+    }
+    return report;
+  }
+
+  _safeTargetIdForPage(page) {
+    try {
+      const target = page && page.target ? page.target() : null;
+      return (target && (target._targetId || target?._targetInfo?.targetId)) || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  _isSessionStreamReady(browserId, userId, session) {
+    if (!session || !session.tabs || session.tabs.length === 0) return false;
+    const activeIndex = Math.min(Math.max(0, Number(session.activeIndex || 0)), session.tabs.length - 1);
+    const activeTab = session.tabs[activeIndex];
+    if (!activeTab || !activeTab.page) return false;
+    let streamSession = streamService.getSession(browserId, userId);
+    if (!streamSession || !streamSession.running) return false;
+    let stats = null;
+    try {
+      stats = streamSession.getStats ? streamSession.getStats() : null;
+    } catch (_) {}
+    if (!stats || !stats.running) return false;
+    const activeTargetId = this._safeTargetIdForPage(activeTab.page);
+    const streamTargetId = String(stats.streamTargetId || '');
+    if (activeTargetId && streamTargetId && activeTargetId !== streamTargetId) return false;
+    const lastSuccessAgeMs = Number(stats.lastSuccessAgeMs || Number.MAX_SAFE_INTEGER);
+    return lastSuccessAgeMs < 8000;
+  }
+
+  _resolveTabReadyState(tab, index, activeIndex, activeStreamReady) {
+    const openedAt = Number(tab?.openedAt || 0);
+    const now = Date.now();
+    // New tab should be reported immediately and marked not-ready for a short bootstrap window.
+    if (openedAt > 0 && (now - openedAt) < 1500) {
+      return false;
+    }
+    if (index !== activeIndex) {
+      return true;
+    }
+    return !!activeStreamReady;
+  }
+
+  async ensureDaemonBrowsers() {
+    const list = browserApi.getAll() || [];
+    for (const item of list) {
+      const browserId = item.id;
+      if (!browserId || this.browsers.has(browserId)) continue;
+      try {
+        await this.launchBrowser(browserId);
+      } catch (e) {
+        logger.warn(browserId, `Daemon launch skipped due to error: ${e.message}`);
+      }
+    }
+  }
+
   async closeAll() {
     this.stopHealthCheck();
     const browserIds = [...this.browsers.keys()];
     for (const browserId of browserIds) {
       await this.closeBrowser(browserId);
     }
+  }
+
+  hasSessionsForBrowser(browserId) {
+    for (const key of this.userSessions.keys()) {
+      if (this._isBrowserSessionKey(key, browserId)) return true;
+    }
+    return false;
+  }
+
+  touchBrowser(browserId) {
+    this.browserLastActive.set(browserId, Date.now());
+  }
+
+  _cleanupBrowserRuntimeData(browserId) {
+    this.browserLastActive.delete(browserId);
+    this.cursorStates.delete(browserId);
+    this.noOpenerSuppressionUntil.delete(browserId);
+    streamService.stopSessionsForBrowser(browserId);
+
+    // Lazy-require to avoid hard circular dependency at module init time.
+    try {
+      const mcpService = require('./mcp-service');
+      if (mcpService && mcpService.clearConsoleBuffer) {
+        mcpService.clearConsoleBuffer(browserId);
+      }
+    } catch (_) {}
+    try {
+      const fileService = require('./file-service');
+      if (fileService && fileService.cleanupBrowserResources) {
+        fileService.cleanupBrowserResources(browserId);
+      }
+    } catch (_) {}
   }
 }
 

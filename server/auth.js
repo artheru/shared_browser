@@ -3,6 +3,8 @@ const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { normalizeToolAccess } = require('./browser-tools-registry');
+const { normalizeDomainRestrictions } = require('./domain-policy');
 
 // 确保数据目录存在
 function ensureDataDir() {
@@ -44,7 +46,13 @@ function readBrowsers() {
     fs.writeFileSync(config.browsersFile, JSON.stringify(defaultBrowsers, null, 2));
     return defaultBrowsers;
   }
-  return JSON.parse(fs.readFileSync(config.browsersFile, 'utf-8'));
+  const data = JSON.parse(fs.readFileSync(config.browsersFile, 'utf-8'));
+  data.browsers = (data.browsers || []).map((browser) => ({
+    ...browser,
+    toolAccess: normalizeToolAccess(browser.toolAccess),
+    domainRestrictions: normalizeDomainRestrictions(browser.domainRestrictions)
+  }));
+  return data;
 }
 
 // 保存浏览器配置
@@ -127,18 +135,32 @@ function verifyWsToken(token) {
 
 // 用户管理 API
 const userApi = {
+  // 获取单个用户（不含密码）
+  getById(id) {
+    const data = readUsers();
+    const u = data.users.find(u => u.id === id);
+    if (!u) return null;
+    return {
+      id: u.id,
+      username: u.username,
+      isAdmin: u.isAdmin,
+      allowedBrowsers: u.allowedBrowsers || []
+    };
+  },
+
   // 获取所有用户
   getAll() {
     const data = readUsers();
     return data.users.map(u => ({
       id: u.id,
       username: u.username,
-      isAdmin: u.isAdmin
+      isAdmin: u.isAdmin,
+      allowedBrowsers: u.allowedBrowsers || []
     }));
   },
   
   // 创建用户
-  async create(username, password, isAdmin = false) {
+  async create(username, password, isAdmin = false, allowedBrowsers = []) {
     const data = readUsers();
     
     if (data.users.find(u => u.username === username)) {
@@ -149,7 +171,8 @@ const userApi = {
       id: Date.now().toString(),
       username,
       password: await bcrypt.hash(password, 10),
-      isAdmin
+      isAdmin,
+      allowedBrowsers: Array.isArray(allowedBrowsers) ? allowedBrowsers : []
     };
     
     data.users.push(newUser);
@@ -158,7 +181,8 @@ const userApi = {
     return {
       id: newUser.id,
       username: newUser.username,
-      isAdmin: newUser.isAdmin
+      isAdmin: newUser.isAdmin,
+      allowedBrowsers: newUser.allowedBrowsers
     };
   },
   
@@ -186,13 +210,18 @@ const userApi = {
     if (typeof updates.isAdmin === 'boolean') {
       data.users[index].isAdmin = updates.isAdmin;
     }
+
+    if (Array.isArray(updates.allowedBrowsers)) {
+      data.users[index].allowedBrowsers = updates.allowedBrowsers;
+    }
     
     saveUsers(data);
     
     return {
       id: data.users[index].id,
       username: data.users[index].username,
-      isAdmin: data.users[index].isAdmin
+      isAdmin: data.users[index].isAdmin,
+      allowedBrowsers: data.users[index].allowedBrowsers || []
     };
   },
   
@@ -227,7 +256,11 @@ const browserApi = {
       id: b.id,
       name: b.name,
       url: b.url,
-      hasPassword: !!b.password
+      hasPassword: !!b.password,
+      mcpEnabled: !!b.mcpEnabled,
+      webApiEnabled: !!b.webApiEnabled,
+      toolAccess: normalizeToolAccess(b.toolAccess),
+      domainRestrictions: normalizeDomainRestrictions(b.domainRestrictions)
     }));
   },
   
@@ -240,7 +273,11 @@ const browserApi = {
       id: browser.id,
       name: browser.name,
       url: browser.url,
-      hasPassword: !!browser.password
+      hasPassword: !!browser.password,
+      mcpEnabled: !!browser.mcpEnabled,
+      webApiEnabled: !!browser.webApiEnabled,
+      toolAccess: normalizeToolAccess(browser.toolAccess),
+      domainRestrictions: normalizeDomainRestrictions(browser.domainRestrictions)
     };
   },
   
@@ -261,7 +298,7 @@ const browserApi = {
   },
   
   // 创建浏览器
-  async create(id, name, url, password = null) {
+  async create(id, name, url, password = null, mcpEnabled = false, webApiEnabled = false, domainRestrictions = []) {
     const data = readBrowsers();
     
     if (data.browsers.find(b => b.id === id)) {
@@ -272,7 +309,11 @@ const browserApi = {
       id,
       name,
       url,
-      password: password ? await bcrypt.hash(password, 10) : null
+      password: password ? await bcrypt.hash(password, 10) : null,
+      mcpEnabled: !!mcpEnabled,
+      webApiEnabled: !!webApiEnabled,
+      toolAccess: normalizeToolAccess(),
+      domainRestrictions: normalizeDomainRestrictions(domainRestrictions)
     };
     
     data.browsers.push(newBrowser);
@@ -282,7 +323,11 @@ const browserApi = {
       id: newBrowser.id,
       name: newBrowser.name,
       url: newBrowser.url,
-      hasPassword: !!newBrowser.password
+      hasPassword: !!newBrowser.password,
+      mcpEnabled: !!newBrowser.mcpEnabled,
+      webApiEnabled: !!newBrowser.webApiEnabled,
+      toolAccess: normalizeToolAccess(newBrowser.toolAccess),
+      domainRestrictions: normalizeDomainRestrictions(newBrowser.domainRestrictions)
     };
   },
   
@@ -308,6 +353,22 @@ const browserApi = {
         ? await bcrypt.hash(updates.password, 10) 
         : null;
     }
+
+    if (typeof updates.mcpEnabled === 'boolean') {
+      data.browsers[index].mcpEnabled = updates.mcpEnabled;
+    }
+
+    if (typeof updates.webApiEnabled === 'boolean') {
+      data.browsers[index].webApiEnabled = updates.webApiEnabled;
+    }
+
+    if (updates.toolAccess && typeof updates.toolAccess === 'object') {
+      data.browsers[index].toolAccess = normalizeToolAccess(updates.toolAccess);
+    }
+
+    if (updates.domainRestrictions !== undefined) {
+      data.browsers[index].domainRestrictions = normalizeDomainRestrictions(updates.domainRestrictions);
+    }
     
     saveBrowsers(data);
     
@@ -315,7 +376,11 @@ const browserApi = {
       id: data.browsers[index].id,
       name: data.browsers[index].name,
       url: data.browsers[index].url,
-      hasPassword: !!data.browsers[index].password
+      hasPassword: !!data.browsers[index].password,
+      mcpEnabled: !!data.browsers[index].mcpEnabled,
+      webApiEnabled: !!data.browsers[index].webApiEnabled,
+      toolAccess: normalizeToolAccess(data.browsers[index].toolAccess),
+      domainRestrictions: normalizeDomainRestrictions(data.browsers[index].domainRestrictions)
     };
   },
   

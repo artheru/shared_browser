@@ -6,6 +6,9 @@
         <button class="btn btn-secondary btn-sm" @click="$router.push('/')">
           {{ t('adminLogs.backToHome') }}
         </button>
+        <button class="btn btn-secondary btn-sm" @click="$router.push('/tools-help')">
+          {{ t('common.help') }}
+        </button>
       </div>
     </header>
 

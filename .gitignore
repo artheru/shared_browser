@@ -4,30 +4,50 @@ node_modules/
 # Build output
 client/dist/
 
-# Runtime data
+# Runtime & user data
 profiles/
 downloads/
 uploads/
-server/data/logs/
-server/data/users.json
-server/data/browsers.json
+server/data/
 
 # Build artifacts
+_build_temp/
+version.json
+
+# Archives (keep repo clean)
 *.zip
 *.7z
-version.json
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# Local config (use params.example.json as template)
+params.json
 
 # OS files
 Thumbs.db
 .DS_Store
 
-# IDE
+# IDE & editor
 .vscode/
 .idea/
 
+# AI / dev workspace (temp, context, screenshots)
+ai-deck/
+
+# Hidden tool dirs
+.cursor/
+*.codex/
+
 # Logs
 *.log
+logs/
 
-# Screenshots (test artifacts)
+# Test artifacts
+test-server/
 test-*.png
 page-*.png
+*-retry*.png
+mcp-test-*.jpg
+remote-test-*.png

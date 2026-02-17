@@ -1,9 +1,31 @@
 const path = require('path');
+const fs = require('fs');
+
+function readParamsFile() {
+  const candidates = [
+    path.join(process.cwd(), 'params.json'),
+    path.join(__dirname, '..', 'params.json')
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      if (fs.existsSync(filePath)) {
+        return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      }
+    } catch (e) {
+      console.warn(`[Config] Failed to read params.json at ${filePath}: ${e.message}`);
+    }
+  }
+
+  return {};
+}
+
+const params = readParamsFile();
 
 module.exports = {
   // 服务器配置
-  port: process.env.PORT || 3000,
-  host: process.env.HOST || '0.0.0.0',  // 监听所有网络接口，允许远程访问
+  port: process.env.PORT || params.port || 3000,
+  host: process.env.HOST || params.host || '0.0.0.0',  // 监听所有网络接口，允许远程访问
 
   // JWT 配置
   jwtSecret: process.env.JWT_SECRET || 'shared-browser-secret-key-change-in-production',
@@ -31,7 +53,8 @@ module.exports = {
     minFps: 5,
     maxFps: 30,
     viewportWidth: 1280,
-    viewportHeight: 720
+    viewportHeight: 720,
+    screenshotTimeoutMs: params.stream?.screenshotTimeoutMs || 12000
   },
 
   // Puppeteer 配置
@@ -80,5 +103,30 @@ module.exports = {
     maxRetryDelay: 60000,       // 最大重试间隔（毫秒）
     resetRetriesAfter: 300000,  // 运行稳定后重置重试计数（5分钟无崩溃）
     healthCheckInterval: 30000  // 健康检查间隔（30秒）
+  },
+
+  // 空闲关闭配置（无会话时回收浏览器）
+  idleClose: {
+    enabled: params.idleClose?.enabled !== false,
+    timeoutMs: params.idleClose?.timeoutMs || 30 * 60 * 1000
+  },
+
+  // 浏览器常驻 daemon 配置
+  browserDaemon: {
+    enabled: params.browserDaemon?.enabled !== false,
+    autoLaunchOnStart: params.browserDaemon?.autoLaunchOnStart !== false
+  },
+
+  // MCP 配置
+  mcp: {
+    enabled: params.mcp?.enabled !== false,
+    routePrefix: params.mcp?.routePrefix || '/api/mcp',
+    debugEnabled: !!params['mcp-debug']
+  },
+
+  // 日志轮转配置
+  logging: {
+    maxFileBytes: Number(params.logging?.maxFileBytes || 5 * 1024 * 1024),
+    maxFiles: Number(params.logging?.maxFiles || 5)
   }
 };

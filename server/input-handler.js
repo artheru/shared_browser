@@ -8,6 +8,7 @@ class InputHandler {
     this.page = page;
     this.lastMouseX = 0;
     this.lastMouseY = 0;
+    this.syntheticTypedKeys = new Set();
   }
 
   // 动态切换目标页面（Tab 切换时调用）
@@ -86,6 +87,54 @@ class InputHandler {
     if (x !== undefined && y !== undefined) {
       await this.page.mouse.move(x, y);
     }
+    // Chromium 自动化下 middle click 对链接不稳定，优先尝试 window.open。
+    // 若被站点策略/弹窗拦截，则回退到原生 middle mouseup。
+    if (this.mapButton(button) === 'middle' && x !== undefined && y !== undefined) {
+      const href = await this.page.evaluate(({ px, py }) => {
+        const el = document.elementFromPoint(px, py);
+        const link = el && el.closest ? el.closest('a[href]') : null;
+        return link ? link.href : '';
+      }, { px: x, py: y }).catch(() => '');
+
+      if (href) {
+        const opened = await this.page.evaluate((url) => {
+          try {
+            const w = window.open(url, '_blank');
+            return !!w;
+          } catch (_) {
+            return false;
+          }
+        }, href).catch(() => false);
+
+        if (opened) {
+          // programmatic open 成功时，抑制原生 auxclick，避免 mouseup 再开一个 tab
+          // 注意：若 open 失败，不能抑制原生 middle-up，否则会出现“偶发开不出 tab”。
+          try {
+            await this.page.evaluate(() => {
+              document.addEventListener('auxclick', function _suppress(e) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                document.removeEventListener('auxclick', _suppress, true);
+              }, { capture: true });
+            });
+          } catch (_) {}
+          try {
+            await this.page.mouse.up({ button: 'middle' });
+          } catch (e) {
+            if (!e.message.includes('not pressed')) throw e;
+          }
+          return;
+        }
+
+        // window.open 被拦截时，回退到原生 middle-up。
+        try {
+          await this.page.mouse.up({ button: 'middle' });
+        } catch (e) {
+          if (!e.message.includes('not pressed')) throw e;
+        }
+        return;
+      }
+    }
     try {
       await this.page.mouse.up({ button: this.mapButton(button) });
     } catch (e) {
@@ -120,29 +169,26 @@ class InputHandler {
   // 键盘按下
   async handleKeyDown(event) {
     const { key, code, modifiers = {} } = event;
-
-    // 处理修饰键组合
-    if (modifiers.ctrl) await this.page.keyboard.down('Control');
-    if (modifiers.alt) await this.page.keyboard.down('Alt');
-    if (modifiers.shift) await this.page.keyboard.down('Shift');
-    if (modifiers.meta) await this.page.keyboard.down('Meta');
-
-    await this.page.keyboard.down(key);
+    // For printable keys, typing is more reliable across layouts/IME than keydown/keyup.
+    if (this.isPrintableKey(key) && !modifiers.ctrl && !modifiers.alt && !modifiers.meta) {
+      await this.page.keyboard.type(key);
+      this.syntheticTypedKeys.add(this.keyIdentity(key, code));
+      return;
+    }
+    await this.page.keyboard.down(this.normalizeKey(key));
   }
 
   // 键盘释放
   async handleKeyUp(event) {
-    const { key, code, modifiers = {} } = event;
-
-    try { await this.page.keyboard.up(key); } catch (e) {
+    const { key, code } = event;
+    const id = this.keyIdentity(key, code);
+    if (this.syntheticTypedKeys.has(id)) {
+      this.syntheticTypedKeys.delete(id);
+      return;
+    }
+    try { await this.page.keyboard.up(this.normalizeKey(key)); } catch (e) {
       if (!e.message.includes('not pressed')) throw e;
     }
-
-    // 释放修饰键（忽略未按下的情况）
-    if (modifiers.meta) try { await this.page.keyboard.up('Meta'); } catch (e) {}
-    if (modifiers.shift) try { await this.page.keyboard.up('Shift'); } catch (e) {}
-    if (modifiers.alt) try { await this.page.keyboard.up('Alt'); } catch (e) {}
-    if (modifiers.ctrl) try { await this.page.keyboard.up('Control'); } catch (e) {}
   }
 
   // 键盘输入
@@ -160,6 +206,27 @@ class InputHandler {
   async handleContextMenu(event) {
     const { x, y } = event;
     await this.page.mouse.click(x, y, { button: 'right' });
+  }
+
+  keyIdentity(key, code) {
+    return `${String(code || '')}|${String(key || '')}`;
+  }
+
+  isPrintableKey(key) {
+    return typeof key === 'string' && key.length === 1;
+  }
+
+  normalizeKey(key) {
+    const map = {
+      ' ': 'Space',
+      Esc: 'Escape',
+      Del: 'Delete',
+      Left: 'ArrowLeft',
+      Right: 'ArrowRight',
+      Up: 'ArrowUp',
+      Down: 'ArrowDown'
+    };
+    return map[key] || key;
   }
 
   // 映射按钮名称

@@ -6,6 +6,9 @@
         <button class="btn btn-secondary btn-sm" @click="$router.push('/')">
           {{ t('adminStatus.backToHome') }}
         </button>
+        <button class="btn btn-secondary btn-sm" @click="$router.push('/tools-help')">
+          {{ t('common.help') }}
+        </button>
       </div>
     </header>
 
@@ -67,6 +70,49 @@
         </div>
       </div>
 
+      <div class="section">
+        <h2 class="section-title">{{ t('adminStatus.streamHealth') }}</h2>
+        <div class="card">
+          <table>
+            <thead>
+              <tr>
+                <th>{{ t('adminStatus.colBrowser') }}</th>
+                <th>{{ t('adminStatus.colUser') }}</th>
+                <th>{{ t('adminStatus.colStatus') }}</th>
+                <th>{{ t('adminStatus.colLastSuccessAgo') }}</th>
+                <th>{{ t('adminStatus.colConsecutiveErrors') }}</th>
+                <th>{{ t('adminStatus.colCapture') }}</th>
+                <th>{{ t('adminStatus.colRecoveries') }}</th>
+                <th>{{ t('adminStatus.colActions') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="streamHealth.length === 0">
+                <td colspan="8" class="empty-row">{{ t('adminStatus.noStreamHealth') }}</td>
+              </tr>
+              <tr v-for="s in streamHealth" :key="`${s.browserId}_${s.userId}`">
+                <td><span class="browser-badge">{{ s.browserId }}</span></td>
+                <td>{{ s.userId }}</td>
+                <td>
+                  <span :class="healthBadgeClass(s)">
+                    {{ healthLabel(s) }}
+                  </span>
+                </td>
+                <td>{{ formatDuration(s.lastSuccessAgeMs) }}</td>
+                <td>{{ s.consecutiveErrors }}</td>
+                <td class="time-cell">{{ (s.avgCaptureDurationMs || 0) }}ms / {{ (s.lastCaptureDurationMs || 0) }}ms</td>
+                <td>{{ s.recoveries || 0 }}</td>
+                <td>
+                  <button class="btn btn-secondary btn-sm" @click="recoverStream(s)">
+                    {{ t('adminStatus.recoverStream') }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- User Usage -->
       <div class="section">
         <h2 class="section-title">{{ t('adminStatus.userUsage') }}</h2>
@@ -103,7 +149,6 @@
         </div>
       </div>
 
-      <!-- Auto refresh -->
       <div class="auto-refresh">
         <label>
           <input type="checkbox" v-model="autoRefresh" @change="toggleAutoRefresh" />
@@ -123,6 +168,7 @@ const { t } = useI18n()
 
 const browserStatus = ref([])
 const usageStats = ref([])
+const streamHealth = ref([])
 const totalSessions = ref(0)
 const autoRefresh = ref(true)
 let refreshTimer = null
@@ -135,9 +181,11 @@ async function loadData() {
       api.get('/api/status'),
       api.get('/api/usage')
     ])
+    const streamResp = await api.get('/api/stream-health')
     browserStatus.value = statusResp.data.browsers || []
     totalSessions.value = statusResp.data.totalSessions || 0
     usageStats.value = usageResp.data || []
+    streamHealth.value = streamResp.data.sessions || []
   } catch (e) {
     console.error('Failed to load status:', e)
   }
@@ -160,6 +208,18 @@ function formatDuration(ms) {
   return `${hr}h ${min % 60}m`
 }
 
+function healthLabel(item) {
+  if (!item.running) return t('adminStatus.stopped')
+  if (item.lastSuccessAgeMs > 15000 || item.consecutiveErrors >= 10) return t('adminStatus.degraded')
+  return t('adminStatus.running')
+}
+
+function healthBadgeClass(item) {
+  if (!item.running) return 'status-badge status-stopped'
+  if (item.lastSuccessAgeMs > 15000 || item.consecutiveErrors >= 10) return 'status-badge status-warn'
+  return 'status-badge status-running'
+}
+
 function formatDistance(px) {
   if (!px || px <= 0) return '0'
   if (px < 1000) return `${px} px`
@@ -174,6 +234,15 @@ function toggleAutoRefresh() {
       clearInterval(refreshTimer)
       refreshTimer = null
     }
+  }
+}
+
+async function recoverStream(item) {
+  try {
+    await api.post(`/api/stream-recover/${encodeURIComponent(item.browserId)}/${encodeURIComponent(item.userId)}`)
+    await loadData()
+  } catch (e) {
+    console.error('Failed to recover stream:', e)
   }
 }
 
@@ -286,6 +355,7 @@ td {
 
 .status-running { background: #2ecc7122; color: #2ecc71; }
 .status-stopped { background: #e74c3c22; color: #e74c3c; }
+.status-warn { background: #f39c1222; color: #f39c12; }
 
 .tab-count-badge {
   display: inline-block;
