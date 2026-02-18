@@ -994,6 +994,7 @@ wss.on('connection', async (ws, req) => {
   let networkMonitor = null;
   let networkStatsTimer = null;
   let wsPingTimer = null;
+  let warmFrameRetryTimer = null;
   let streamRecovering = false;
   let currentWsConnKey = null;
 
@@ -1123,15 +1124,40 @@ wss.on('connection', async (ws, req) => {
             streamSession = streamService.createSession(browserId, user.id, activePage, ws);
 
             // 若已有后台常驻串流缓存帧，先秒发一帧，减少首屏等待
-            const warmFrame = streamService.getLatestFrame(browserId);
-            if (warmFrame && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: 'frame',
-                timestamp: warmFrame.timestamp,
-                quality: warmFrame.quality,
-                size: warmFrame.size
-              }));
-              ws.send(warmFrame.buffer);
+            const sendWarmFrameIfAny = () => {
+              const warmFrame = streamService.getLatestFrame(browserId);
+              if (!warmFrame || ws.readyState !== WebSocket.OPEN) return false;
+              try {
+                ws.send(JSON.stringify({
+                  type: 'frame',
+                  timestamp: warmFrame.timestamp,
+                  quality: warmFrame.quality,
+                  size: warmFrame.size
+                }));
+                ws.send(warmFrame.buffer);
+                return true;
+              } catch (_) {
+                return false;
+              }
+            };
+
+            // Immediate attempt
+            const sentWarmNow = sendWarmFrameIfAny();
+
+            // Cold start: warmup stream may not have produced the first frame yet.
+            // Retry briefly so users don't need to refresh the SB UI to see the first frame.
+            if (!sentWarmNow) {
+              if (warmFrameRetryTimer) clearInterval(warmFrameRetryTimer);
+              let tries = 0;
+              const maxTries = 10; // ~2s total
+              warmFrameRetryTimer = setInterval(() => {
+                tries += 1;
+                const ok = sendWarmFrameIfAny();
+                if (ok || tries >= maxTries) {
+                  clearInterval(warmFrameRetryTimer);
+                  warmFrameRetryTimer = null;
+                }
+              }, 200);
             }
 
             // 设置串流死亡回调
@@ -1696,6 +1722,10 @@ wss.on('connection', async (ws, req) => {
     if (wsPingTimer) {
       clearInterval(wsPingTimer);
       wsPingTimer = null;
+    }
+    if (warmFrameRetryTimer) {
+      clearInterval(warmFrameRetryTimer);
+      warmFrameRetryTimer = null;
     }
 
     if (networkMonitor) {

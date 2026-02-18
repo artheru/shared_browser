@@ -75,7 +75,7 @@ export default {
     mcpEndpoint: 'MCP Endpoint',
     mcpServerJson: 'MCP Server JSON',
     mcpHelp: 'Open MCP help',
-    aiHelp: 'Open AI help',
+    apiHelp: 'Open API help',
     openToolsHelp: 'Open Tools Help',
     toolName: 'Tool',
     toolDescription: 'Description',
@@ -138,6 +138,9 @@ export default {
     aiReadOnlyMode: 'AI operation mode: local input is blocked',
     backToSelection: 'Back to Browser List',
     shutdownBrowser: 'Shutdown Browser',
+    wsConnectFailed: 'WebSocket connection failed. Please refresh or log in again.',
+    policyBlockedTitle: 'Blocked',
+    policyBlockedMessage: 'Navigation blocked: {url}',
   },
 
   // ==================== Admin Logs ====================
@@ -332,9 +335,16 @@ export default {
     sectionTools: 'Declared Tools',
     sectionAiManual: 'AI Operation Manual',
     mcpHelp: 'MCP help',
-    aiHelp: 'AI help',
+    apiHelp: 'API help',
     fullApiHint: 'All routes below are full URLs, ready to call directly.',
     mcpJsonTitle: 'MCP Server JSON',
-    copyMcpJson: 'Copy MCP JSON'
+    copyMcpJson: 'Copy MCP JSON',
+    reloadToken: 'Reload token from session',
+    copyToken: 'Copy token',
+    newToken: 'New token',
+    newTokenTitle: 'New token',
+    newTokenDesc: 'Get a fresh JWT token via login API (writes to this browser local session).',
+    newTokenMissing: 'Please enter username and password',
+    newTokenFailed: 'Failed to get token'
   }
 }

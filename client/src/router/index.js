@@ -55,7 +55,7 @@ const routes = [
     redirect: '/tools-help/mcp'
   },
   {
-    path: '/tools-help/:mode(mcp|ai)',
+    path: '/tools-help/:mode(mcp|api)',
     name: 'ToolsHelp',
     component: () => import('../views/ToolsHelp.vue'),
     meta: { requiresAuth: true }

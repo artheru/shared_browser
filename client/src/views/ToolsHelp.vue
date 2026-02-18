@@ -52,10 +52,10 @@
           </button>
           <button
             class="btn btn-sm"
-            :class="selectedHelpType === 'ai' ? 'btn-primary' : 'btn-secondary'"
-            @click="selectedHelpType = 'ai'; generateGuide()"
+            :class="selectedHelpType === 'api' ? 'btn-primary' : 'btn-secondary'"
+            @click="selectedHelpType = 'api'; generateGuide()"
           >
-            {{ t('toolsHelp.aiHelp') }}
+            {{ t('toolsHelp.apiHelp') }}
           </button>
         </div>
         <div v-if="selectedHelpType === 'mcp'" class="hint">
@@ -73,20 +73,23 @@
           </label>
           <label>
             <span>{{ t('toolsHelp.browserId') }}</span>
-            <input v-model.trim="guideForm.browserId" class="input" type="text" />
-          </label>
-          <label>
-            <span>{{ t('toolsHelp.username') }}</span>
-            <input v-model.trim="guideForm.username" class="input" type="text" />
-          </label>
-          <label>
-            <span>{{ t('toolsHelp.password') }}</span>
-            <input v-model="guideForm.password" class="input" type="text" />
+            <input v-model.trim="guideForm.browserId" class="input" type="text" disabled />
           </label>
           <label class="token-field">
             <span>{{ t('toolsHelp.token') }}</span>
-            <textarea v-model="guideForm.token" class="input" rows="3"></textarea>
+            <textarea v-model="guideForm.token" class="input" rows="3" disabled></textarea>
             <small>{{ t('toolsHelp.tokenHint') }}</small>
+            <div class="token-actions">
+              <button class="btn btn-secondary btn-sm" type="button" @click="reloadTokenFromSession">
+                {{ t('toolsHelp.reloadToken') }}
+              </button>
+              <button class="btn btn-secondary btn-sm" type="button" @click="showNewTokenModal = true">
+                {{ t('toolsHelp.newToken') }}
+              </button>
+              <button class="btn btn-secondary btn-sm" type="button" :disabled="!guideForm.token" @click="copyText(guideForm.token)">
+                {{ t('toolsHelp.copyToken') }}
+              </button>
+            </div>
           </label>
         </div>
 
@@ -105,6 +108,32 @@
         <h4>{{ t('toolsHelp.guidePreview') }}</h4>
         <pre v-if="guideMarkdown" class="guide-preview">{{ guideMarkdown }}</pre>
         <div v-else class="hint">{{ t('toolsHelp.noGuideYet') }}</div>
+      </div>
+
+      <!-- New token modal -->
+      <div v-if="showNewTokenModal" class="modal-overlay" @click.self="closeNewTokenModal">
+        <div class="modal">
+          <div class="modal-header">
+            <h3>{{ t('toolsHelp.newTokenTitle') }}</h3>
+            <button class="modal-close" @click="closeNewTokenModal">&times;</button>
+          </div>
+          <p class="desc">{{ t('toolsHelp.newTokenDesc') }}</p>
+          <div class="form-grid token-modal-grid">
+            <label>
+              <span>{{ t('toolsHelp.username') }}</span>
+              <input v-model.trim="newTokenForm.username" class="input" type="text" autocomplete="username" />
+            </label>
+            <label>
+              <span>{{ t('toolsHelp.password') }}</span>
+              <input v-model="newTokenForm.password" class="input" type="password" autocomplete="current-password" />
+            </label>
+          </div>
+          <div v-if="newTokenError" class="error-message">{{ newTokenError }}</div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" @click="closeNewTokenModal">{{ t('common.cancel') }}</button>
+            <button class="btn btn-primary" @click="requestNewToken">{{ t('common.confirm') }}</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -125,10 +154,11 @@ const selectedHelpType = ref('mcp')
 const guideForm = ref({
   serverBaseUrl: window.location.origin || 'http://127.0.0.1:3000',
   browserId: 'test',
-  username: '',
-  password: '',
   token: localStorage.getItem('token') || ''
 })
+const showNewTokenModal = ref(false)
+const newTokenForm = ref({ username: '', password: '' })
+const newTokenError = ref('')
 
 const normalizedBaseUrl = computed(() => {
   const value = (guideForm.value.serverBaseUrl || window.location.origin || '').trim()
@@ -161,12 +191,10 @@ function formatToolsForMarkdown() {
 function buildGuideMarkdown() {
   const base = guideForm.value.serverBaseUrl || window.location.origin
   const browserId = guideForm.value.browserId || 'test'
-  const username = guideForm.value.username || 'admin'
-  const password = guideForm.value.password || 'admin123'
   const token = guideForm.value.token || '<paste-token-here>'
   const isMcpHelp = selectedHelpType.value === 'mcp'
-  const guideTitle = isMcpHelp ? 'MCP Help Guide' : 'AI Help Guide'
-  const modeLabel = isMcpHelp ? 'MCP help' : 'AI help'
+  const guideTitle = isMcpHelp ? 'MCP Help Guide' : 'API Help Guide'
+  const modeLabel = isMcpHelp ? 'mcp' : 'api'
   const modeIntro = isMcpHelp
     ? 'Use this guide when configuring AI clients through MCP server JSON.'
     : 'Use this guide when calling HTTP API endpoints directly.'
@@ -188,18 +216,17 @@ Authorization: Bearer ${token}
 ## Server Context
 - Base URL: \`${base}\`
 - Browser ID: \`${browserId}\`
-- Username: \`${username}\`
-- Password: \`${password}\`
 - Token: \`${token}\`
 - Help Mode: \`${modeLabel}\`
 
 ${modeIntro}
 
-## Login
+## Login (Optional)
+If you already have a JWT token (e.g. from the web UI login), you can skip this step.
 \`\`\`bash
 curl -s -X POST "${base}/api/auth/login" \\
   -H "Content-Type: application/json" \\
-  -d '{"username":"${username}","password":"${password}"}'
+  -d '{"username":"<username>","password":"<password>"}'
 \`\`\`
 
 ## List Browsers
@@ -262,7 +289,7 @@ function generateGuide() {
 
 function applyRoutePreset() {
   const modeFromPath = route.params?.mode
-  if (modeFromPath === 'mcp' || modeFromPath === 'ai') {
+  if (modeFromPath === 'mcp' || modeFromPath === 'api') {
     selectedHelpType.value = modeFromPath
   }
   const queryBrowserId = route.query?.browserId
@@ -270,8 +297,41 @@ function applyRoutePreset() {
     guideForm.value.browserId = queryBrowserId.trim()
   }
   const queryHelpType = route.query?.helpType
-  if (queryHelpType === 'mcp' || queryHelpType === 'ai' || queryHelpType === 'api') {
-    selectedHelpType.value = queryHelpType === 'api' ? 'ai' : queryHelpType
+  if (queryHelpType === 'mcp' || queryHelpType === 'api') {
+    selectedHelpType.value = queryHelpType
+  }
+}
+
+function reloadTokenFromSession() {
+  guideForm.value.token = localStorage.getItem('token') || ''
+  generateGuide()
+}
+
+function closeNewTokenModal() {
+  showNewTokenModal.value = false
+  newTokenError.value = ''
+  newTokenForm.value = { username: '', password: '' }
+}
+
+async function requestNewToken() {
+  newTokenError.value = ''
+  const username = String(newTokenForm.value.username || '').trim()
+  const password = String(newTokenForm.value.password || '')
+  if (!username || !password) {
+    newTokenError.value = t('toolsHelp.newTokenMissing')
+    return
+  }
+  try {
+    const resp = await api.post('/api/auth/login', { username, password })
+    const token = resp.data?.token || ''
+    if (!token) throw new Error('No token returned')
+    localStorage.setItem('token', token)
+    if (resp.data?.user) localStorage.setItem('user', JSON.stringify(resp.data.user))
+    guideForm.value.token = token
+    closeNewTokenModal()
+    generateGuide()
+  } catch (e) {
+    newTokenError.value = e.response?.data?.error || e.message || t('toolsHelp.newTokenFailed')
   }
 }
 
@@ -393,6 +453,17 @@ th, td {
 
 .token-field {
   grid-column: 1 / -1;
+}
+
+.token-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.token-modal-grid {
+  margin-top: 10px;
 }
 
 .actions {

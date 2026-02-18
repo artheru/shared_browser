@@ -1014,6 +1014,14 @@ class BrowserManager {
       commandLog: []               // last N commands: { who, type, detail, ts }
     };
     session.tabs.push(tab);
+
+    // ====== Domain restriction: preflight intercept (avoid navigating first) ======
+    // We still keep _enforceDomainRestriction as a last-resort guard, but for user clicks
+    // we want to block the navigation request before Chrome actually leaves the page.
+    this._setupDomainRestrictionInterception(key, tab, page).catch((e) => {
+      logger.warn(this._extractBrowserIdFromSessionKey(key), `Domain interception setup failed: ${e.message}`);
+    });
+
     let navDebounceTimer = null;
     let readyDebounceTimer = null;
     let readyFallbackTimer = null;
@@ -1203,6 +1211,67 @@ class BrowserManager {
     });
 
     return session.tabs.length - 1;
+  }
+
+  async _setupDomainRestrictionInterception(key, tab, page) {
+    if (!page || page.__sbDomainInterceptHooked) return;
+    page.__sbDomainInterceptHooked = true;
+
+    const browserId = this._extractBrowserIdFromSessionKey(key);
+    // Interception can be enabled only once per page; ignore if it fails (e.g. already enabled).
+    try {
+      await page.setRequestInterception(true);
+    } catch (_) {}
+
+    // Avoid spamming the UI with repeated blocked events (some sites retry).
+    let lastBlocked = { url: '', at: 0 };
+
+    page.on('request', async (req) => {
+      try {
+        if (!req) return;
+        // Only block top-level navigations to http(s). Let subresources through.
+        if (!req.isNavigationRequest || !req.isNavigationRequest()) return req.continue();
+        if (req.resourceType && req.resourceType() !== 'document') return req.continue();
+        const frame = req.frame && req.frame();
+        if (frame && page.mainFrame && frame !== page.mainFrame()) return req.continue();
+
+        const url = String(req.url ? req.url() : '');
+        if (!(url.startsWith('http://') || url.startsWith('https://'))) return req.continue();
+
+        const browserCfg = browserApi.getById(browserId);
+        const user = this._resolveUserForTabOwner(tab?.owner);
+        const check = isUrlAllowedForUser(url, browserCfg, user);
+        if (check.allowed) return req.continue();
+
+        const now = Date.now();
+        if (lastBlocked.url !== url || (now - lastBlocked.at) > 1200) {
+          lastBlocked = { url, at: now };
+          logger.warn(browserId, `Blocked navigation (preflight) for user ${user.id}`, {
+            url,
+            reason: check.reason || '',
+            allowedDomains: browserCfg?.domainRestrictions || []
+          });
+          this._emitEvent(key, {
+            type: 'domain_blocked',
+            blockedUrl: url,
+            allowedDomains: browserCfg?.domainRestrictions || []
+          });
+        }
+        try {
+          // Provide a reason string when possible; puppeteer may ignore unknown codes.
+          await req.abort('blockedbyclient');
+        } catch (_) {
+          try { await req.abort(); } catch (_) {}
+        }
+      } catch (e) {
+        try { await req.continue(); } catch (_) {}
+      }
+    });
+
+    // Keep tabs list updated if the browser produced an error page after a blocked attempt.
+    page.on('framenavigated', () => {
+      // no-op; the existing framenavigated handler in _addTabToSession covers tab url/title.
+    });
   }
 
   getTabList(browserId, userId) {

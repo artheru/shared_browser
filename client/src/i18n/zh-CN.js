@@ -75,7 +75,7 @@ export default {
     mcpEndpoint: 'MCP 端点',
     mcpServerJson: 'MCP Server JSON',
     mcpHelp: '打开 MCP 帮助',
-    aiHelp: '打开 AI 帮助',
+    apiHelp: '打开 API 帮助',
     openToolsHelp: '打开工具帮助页',
     toolName: '工具名',
     toolDescription: '说明',
@@ -138,6 +138,9 @@ export default {
     aiReadOnlyMode: 'AI 操作模式：本地输入已阻止',
     backToSelection: '返回列表',
     shutdownBrowser: '关闭浏览器',
+    wsConnectFailed: 'WebSocket 连接失败，请刷新页面或重新登录。',
+    policyBlockedTitle: '访问已阻止',
+    policyBlockedMessage: '无权限访问该网址：{url}',
   },
 
   // ==================== Admin Logs ====================
@@ -332,9 +335,16 @@ export default {
     sectionTools: '已声明工具',
     sectionAiManual: 'AI 操作手册',
     mcpHelp: 'MCP 帮助',
-    aiHelp: 'AI 帮助',
+    apiHelp: 'API 帮助',
     fullApiHint: '下面展示的是可直接调用的完整 URL（已包含 browserId）。',
     mcpJsonTitle: 'MCP Server JSON',
-    copyMcpJson: '复制 MCP JSON'
+    copyMcpJson: '复制 MCP JSON',
+    reloadToken: '从当前会话读取 token',
+    copyToken: '复制 token',
+    newToken: '新建 token',
+    newTokenTitle: '新建 token',
+    newTokenDesc: '通过登录接口重新获取一枚 JWT token（会写入本浏览器本地会话）。',
+    newTokenMissing: '请输入用户名和密码',
+    newTokenFailed: '获取 token 失败'
   }
 }

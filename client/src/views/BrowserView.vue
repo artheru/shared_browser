@@ -88,6 +88,18 @@
       </div>
     </div>
 
+    <!-- H5 warning (policy / blocked navigation, etc.) -->
+    <div v-if="policyNotice" class="policy-toast" @click.stop>
+      <div class="policy-toast-left">
+        <i class="fa-solid fa-shield-halved"></i>
+      </div>
+      <div class="policy-toast-body">
+        <div class="policy-toast-title">{{ policyNotice.title }}</div>
+        <div class="policy-toast-msg">{{ policyNotice.message }}</div>
+      </div>
+      <button class="policy-toast-close" type="button" @click="clearPolicyNotice" :title="t('common.close')">×</button>
+    </div>
+
     <!-- Tab 栏 -->
     <div class="tab-bar">
       <div class="tab-list" ref="tabListRef">
@@ -357,6 +369,10 @@ const canSendUserOperation = computed(() => {
 let ws = null
 let manualClose = false
 const isConnected = ref(false)
+let everConnected = false
+let wsConnectFailStreak = 0
+let wsHandshakeTimer = null
+let wsOpenTimer = null
 const streamContainer = ref(null)
 const streamImage = ref(null)
 const urlInputRef = ref(null)
@@ -364,6 +380,8 @@ const urlFocused = ref(false)
 const isTouchDevice = ref(false)
 const mobileKeyboardInputRef = ref(null)
 let mobileKeyboardBuffer = ''
+const policyNotice = ref(null)
+let policyNoticeTimer = null
 
 // 串流画面
 const frameSrc = ref('')
@@ -452,6 +470,7 @@ let streamLatencyMs = 0
 let noFrameWarnStreak = 0
 let lastRecoverRequestAt = 0
 let streamErrorTimer = null
+let firstFrameTimer = null
 
 // 反馈计时器
 let feedbackTimer = null
@@ -479,6 +498,11 @@ function focusStream(event) {
   if (event.target.tagName !== 'INPUT' && event.target.tagName !== 'BUTTON' &&
       event.target.tagName !== 'A') {
     streamContainer.value.focus()
+    // Desktop: keep a hidden textarea focused so IME/composition input works reliably.
+    // Touch devices rely on an explicit "Keyboard" button to avoid unwanted OSK popups.
+    if (!isTouchDevice.value) {
+      focusTextBridge(false)
+    }
   }
 }
 
@@ -493,11 +517,33 @@ function goBackToList() {
 function openMobileKeyboard() {
   if (!isConnected.value) return
   if (!canSendUserOperation.value) return
+  focusTextBridge(true)
+}
+
+function focusTextBridge(selectEnd = false) {
   const el = mobileKeyboardInputRef.value
   if (!el) return
-  el.focus()
-  const len = el.value.length
-  el.setSelectionRange(len, len)
+  // preventScroll is best-effort; older browsers may ignore it.
+  try { el.focus({ preventScroll: true }) } catch (_) { el.focus() }
+  if (selectEnd && typeof el.setSelectionRange === 'function') {
+    const len = el.value.length
+    try { el.setSelectionRange(len, len) } catch (_) {}
+  }
+}
+
+function showPolicyNotice(title, message, { ttlMs = 4500 } = {}) {
+  policyNotice.value = { title: String(title || ''), message: String(message || '') }
+  if (policyNoticeTimer) clearTimeout(policyNoticeTimer)
+  policyNoticeTimer = setTimeout(() => {
+    policyNoticeTimer = null
+    policyNotice.value = null
+  }, ttlMs)
+}
+
+function clearPolicyNotice() {
+  if (policyNoticeTimer) clearTimeout(policyNoticeTimer)
+  policyNoticeTimer = null
+  policyNotice.value = null
 }
 
 function updateTouchMode() {
@@ -574,6 +620,17 @@ function connect() {
   const wsUrl = `${protocol}//${window.location.host}/ws`
 
   ws = new WebSocket(wsUrl)
+
+  // Some environments may keep WS in CONNECTING without firing error/close promptly.
+  // Guard this to avoid infinite blank "connecting..." screen.
+  if (wsOpenTimer) clearTimeout(wsOpenTimer)
+  wsOpenTimer = setTimeout(() => {
+    if (manualClose) return
+    if (!ws) return
+    if (ws.readyState !== WebSocket.CONNECTING) return
+    streamError.value = tr('browserView.wsConnectFailed', 'Connection failed. Please refresh or re-login.')
+    try { ws.close() } catch (_) {}
+  }, 5000)
   const rawSend = ws.send.bind(ws)
   ws.send = (payload) => {
     let type = 'binary'
@@ -594,8 +651,22 @@ function connect() {
     pushWsEvent('state', 'open')
     reconnectAttempts = 0
     streamError.value = ''
+    if (wsOpenTimer) {
+      clearTimeout(wsOpenTimer)
+      wsOpenTimer = null
+    }
     const token = localStorage.getItem('token')
     ws.send(JSON.stringify({ type: 'auth', token }))
+
+    // If we cannot complete handshake (auth -> connect -> connected) within a short window,
+    // show a visible error and force reconnect instead of endless blank "connecting...".
+    if (wsHandshakeTimer) clearTimeout(wsHandshakeTimer)
+    wsHandshakeTimer = setTimeout(() => {
+      if (manualClose) return
+      if (isConnected.value) return
+      streamError.value = tr('browserView.wsConnectFailed', 'Connection failed. Please refresh or re-login.')
+      try { ws?.close() } catch (_) {}
+    }, 7000)
   }
 
   ws.onmessage = async (event) => {
@@ -613,7 +684,21 @@ function connect() {
     console.log('WebSocket closed')
     pushWsEvent('state', 'close')
     isConnected.value = false
+    if (wsOpenTimer) {
+      clearTimeout(wsOpenTimer)
+      wsOpenTimer = null
+    }
+    if (wsHandshakeTimer) {
+      clearTimeout(wsHandshakeTimer)
+      wsHandshakeTimer = null
+    }
     if (!manualClose) {
+      // If we never managed to fully connect to a browser session after several retries,
+      // show a visible error instead of endless "connecting..." blank screen.
+      wsConnectFailStreak += 1
+      if (wsConnectFailStreak >= 3) {
+        streamError.value = tr('browserView.wsConnectFailed', 'Connection failed. Please refresh or re-login.')
+      }
       scheduleReconnect()
     }
   }
@@ -642,11 +727,27 @@ function handleMessage(message) {
 
     case 'connected':
       isConnected.value = true
+      everConnected = true
+      wsConnectFailStreak = 0
+      if (wsHandshakeTimer) {
+        clearTimeout(wsHandshakeTimer)
+        wsHandshakeTimer = null
+      }
       lastFrameAt = Date.now()
       startFeedback()
       loadFiles()
       loadActiveDownloads()
       sendTabListRequest('connected-init', true)
+      // If we don't get the first frame quickly, ask server to recover stream.
+      if (firstFrameTimer) clearTimeout(firstFrameTimer)
+      firstFrameTimer = setTimeout(() => {
+        if (!isConnected.value) return
+        if (frameSrc.value) return
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'stream_recover', reason: 'first-frame-timeout', idleMs: Date.now() - lastFrameAt }))
+          pushWsEvent('tx', 'stream_recover', 'first-frame-timeout')
+        }
+      }, 2500)
       break
 
     case 'ws_ping':
@@ -806,6 +907,11 @@ function handleMessage(message) {
         blockedUrl: message.blockedUrl,
         allowedDomains: message.allowedDomains || []
       })
+      showPolicyNotice(
+        tr('browserView.policyBlockedTitle', 'Blocked'),
+        tr('browserView.policyBlockedMessage', 'Blocked navigation: {url}', { url: message.blockedUrl || '' }),
+        { ttlMs: 6500 }
+      )
       break
 
     case 'network_stats':
@@ -860,6 +966,10 @@ function checkDialogState() {
 }
 
 function handleFrame(data) {
+  if (firstFrameTimer) {
+    clearTimeout(firstFrameTimer)
+    firstFrameTimer = null
+  }
   const blob = new Blob([data], { type: 'image/jpeg' })
   const url = URL.createObjectURL(blob)
 
@@ -1050,6 +1160,10 @@ function handleMouseMove(event) {
 
 function handleMouseDown(event) {
   if (!isConnected.value) return
+  // Ensure the hidden text bridge is focused before typing (desktop).
+  if (!isTouchDevice.value) {
+    focusTextBridge(false)
+  }
   if (event.button === 1) event.preventDefault()
   mouseDownInStream = true
   const { x, y } = getRelativeCoords(event)
@@ -1115,6 +1229,8 @@ async function handleKeyDown(event) {
   if (!isConnected.value) return
   if (!canSendUserOperation.value) return
 
+  const isTextBridge = (event.target === mobileKeyboardInputRef.value)
+
   // URL 输入框聚焦时不拦截（除了 Escape）
   if (urlFocused.value) {
     if (event.key === 'Escape') {
@@ -1125,7 +1241,16 @@ async function handleKeyDown(event) {
   }
 
   // 其他输入框不拦截
-  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') && event.target !== streamContainer.value) return
+  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') &&
+      !isTextBridge &&
+      event.target !== streamContainer.value) return
+
+  // When the hidden text bridge is focused, let it produce actual text (incl. IME).
+  // We only forward non-printable keys from keydown/keyup, and rely on @input for text.
+  if (isTextBridge && typeof event.key === 'string' && event.key.length === 1 &&
+      !event.ctrlKey && !event.altKey && !event.metaKey) {
+    return
+  }
 
   // 剪贴板操作特殊处理
   if (event.ctrlKey && !event.altKey && !event.metaKey) {
@@ -1194,7 +1319,16 @@ function handleKeyUp(event) {
   if (!isConnected.value) return
   if (!canSendUserOperation.value) return
   if (urlFocused.value) return
-  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') && event.target !== streamContainer.value) return
+
+  const isTextBridge = (event.target === mobileKeyboardInputRef.value)
+  if ((event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') &&
+      !isTextBridge &&
+      event.target !== streamContainer.value) return
+
+  if (isTextBridge && typeof event.key === 'string' && event.key.length === 1 &&
+      !event.ctrlKey && !event.altKey && !event.metaKey) {
+    return
+  }
 
   event.preventDefault()
   sendInput({
@@ -1534,8 +1668,9 @@ function handlePaste(event) {
   if (!canSendUserOperation.value) return
   // URL 输入框或对话框输入框聚焦时不拦截
   if (urlFocused.value) return
+  const isTextBridge = (event.target === mobileKeyboardInputRef.value)
   if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
-    if (event.target !== streamContainer.value) return
+    if (!isTextBridge && event.target !== streamContainer.value) return
   }
 
   event.preventDefault()
@@ -1712,11 +1847,24 @@ onUnmounted(() => {
     clearTimeout(streamErrorTimer)
     streamErrorTimer = null
   }
+  if (firstFrameTimer) {
+    clearTimeout(firstFrameTimer)
+    firstFrameTimer = null
+  }
+  if (wsHandshakeTimer) {
+    clearTimeout(wsHandshakeTimer)
+    wsHandshakeTimer = null
+  }
+  if (wsOpenTimer) {
+    clearTimeout(wsOpenTimer)
+    wsOpenTimer = null
+  }
   if (streamWatchTimer) clearInterval(streamWatchTimer)
   if (tabSyncTimer) clearInterval(tabSyncTimer)
   if (filesSyncTimer) clearInterval(filesSyncTimer)
   if (wsDebugTimer) clearInterval(wsDebugTimer)
   if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (policyNoticeTimer) clearTimeout(policyNoticeTimer)
 
   if (frameSrc.value) {
     URL.revokeObjectURL(frameSrc.value)
@@ -2664,5 +2812,61 @@ function formatAge(ts) {
   width: 1px;
   height: 1px;
   pointer-events: none;
+}
+
+.policy-toast {
+  position: fixed;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1200;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: min(720px, calc(100vw - 24px));
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(20, 20, 20, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f5f7fb;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+}
+
+.policy-toast-left {
+  color: #ffd089;
+  padding-top: 2px;
+}
+
+.policy-toast-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.policy-toast-title {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.1px;
+}
+
+.policy-toast-msg {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #d6deea;
+  word-break: break-word;
+}
+
+.policy-toast-close {
+  border: none;
+  background: transparent;
+  color: #cfd6e2;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.policy-toast-close:hover {
+  color: #ffffff;
 }
 </style>

@@ -16,9 +16,6 @@
         <button v-if="authStore.isAdmin" class="btn btn-secondary btn-sm" @click="goToLogs">
           {{ t('browserList.logs') }}
         </button>
-        <button v-if="authStore.isAdmin" class="btn btn-secondary btn-sm" @click="goToStatus">
-          {{ t('browserList.status') }}
-        </button>
         <button v-if="authStore.isAdmin" class="btn btn-secondary btn-sm" @click="goToCalllog">
           {{ t('browserList.calllog') }}
         </button>
@@ -66,8 +63,8 @@
               <button
                 class="inline-help-btn"
                 type="button"
-                :title="t('browserList.aiHelp')"
-                @click.stop="openBrowserHelp(browser, 'ai')"
+                :title="t('browserList.apiHelp')"
+                @click.stop="openBrowserHelp(browser, 'api')"
               >?</button>
             </span>
             <span v-if="browser.hasPassword" class="dot-sep">•</span>
@@ -124,7 +121,7 @@
     </div>
 
     <!-- Browser tools status modal -->
-    <div v-if="showToolsModal" class="modal-overlay">
+    <div v-if="showToolsModal" class="modal-overlay" @click.self="closeToolsModal">
       <div class="modal tools-modal">
         <div class="modal-header">
           <h3>{{ t('browserList.viewToolsStatus') }} - {{ selectedToolsBrowser?.name }}</h3>
@@ -194,7 +191,7 @@
     </div>
     
     <!-- Password modal -->
-    <div v-if="showPasswordModal" class="modal-overlay">
+    <div v-if="showPasswordModal" class="modal-overlay" @click.self="showPasswordModal = false">
       <div class="modal">
         <div class="modal-header">
           <h3>{{ t('browserList.enterPassword') }}</h3>
@@ -219,7 +216,7 @@
     </div>
     
     <!-- Add/Edit browser modal -->
-    <div v-if="showAddModal || showEditModal" class="modal-overlay">
+    <div v-if="showAddModal || showEditModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal">
         <div class="modal-header">
           <h3>{{ showEditModal ? t('browserList.editBrowser') : t('browserList.addBrowserTitle') }}</h3>
@@ -298,7 +295,7 @@
     </div>
     
     <!-- Delete confirmation modal -->
-    <div v-if="showDeleteModal" class="modal-overlay">
+    <div v-if="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false">
       <div class="modal">
         <div class="modal-header">
           <h3>{{ t('browserList.confirmDelete') }}</h3>
@@ -565,7 +562,7 @@ function goToToolsHelp() {
 }
 
 function openBrowserHelp(browser, helpType) {
-  const mode = helpType === 'ai' ? 'ai' : 'mcp'
+  const mode = helpType === 'api' ? 'api' : 'mcp'
   router.push({
     path: `/tools-help/${mode}`,
     query: {
@@ -605,10 +602,6 @@ function goToUsers() {
 
 function goToLogs() {
   router.push('/admin/logs')
-}
-
-function goToStatus() {
-  router.push('/admin/status')
 }
 
 function goToCalllog() {

@@ -74,7 +74,7 @@
     </div>
     
     <!-- Add/Edit user modal -->
-    <div v-if="showAddModal || showEditModal" class="modal-overlay">
+    <div v-if="showAddModal || showEditModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal">
         <div class="modal-header">
           <h3>{{ showEditModal ? t('adminUsers.editUser') : t('adminUsers.addUserTitle') }}</h3>
@@ -117,7 +117,7 @@
     </div>
     
     <!-- Delete confirmation modal -->
-    <div v-if="showDeleteModal" class="modal-overlay">
+    <div v-if="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false">
       <div class="modal">
         <div class="modal-header">
           <h3>{{ t('adminUsers.confirmDelete') }}</h3>
@@ -132,7 +132,7 @@
     </div>
 
     <!-- Permissions modal -->
-    <div v-if="showPermModal" class="modal-overlay">
+    <div v-if="showPermModal" class="modal-overlay" @click.self="closePermModal">
       <div class="modal perm-modal">
         <div class="modal-header">
           <h3>{{ t('adminUsers.permissionsTitle') }} - {{ permUser?.username }}</h3>
