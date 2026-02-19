@@ -100,6 +100,8 @@ export default {
     connected: '已连接',
     connecting: '连接中...',
     statsTooltip: '状态栏说明：FPS=当前接收帧率，质量%=服务端截图质量参数，↓带宽=当前串流下行速率',
+    statsTooltip2: '延迟 + 决策（服务端）：例如 Q20x0.6',
+    streamBandwidth: '串流下行带宽（服务端 -> 客户端）',
     remoteNetworkActivity: '远程浏览器网络活动',
     remoteActiveRequests: '远程浏览器活跃请求数',
     files: '文件 ({count})',

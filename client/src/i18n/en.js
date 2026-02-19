@@ -100,6 +100,8 @@ export default {
     connected: 'Connected',
     connecting: 'Connecting...',
     statsTooltip: 'Status meaning: FPS=current received frame rate, quality%=server screenshot quality setting, ↓bandwidth=stream downlink throughput',
+    statsTooltip2: 'Latency + decision (server): e.g. Q20x0.6',
+    streamBandwidth: 'Stream downlink bandwidth (server -> client)',
     remoteNetworkActivity: 'Remote browser network activity',
     remoteActiveRequests: 'Remote browser active requests',
     files: 'Files ({count})',

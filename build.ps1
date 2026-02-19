@@ -4,6 +4,12 @@
 #  输出: shared-browser.zip（可直接部署到目标机器）
 # ============================================================
 
+param(
+    # Optional phrase for deploy verification (e.g. "jackie").
+    # It will be embedded into version.json and the version string.
+    [string]$Phrase = $env:SB_BUILD_PHRASE
+)
+
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 
@@ -17,7 +23,21 @@ Write-Host ""
 $now = Get-Date
 $versionStr = $now.ToString("yyyy.MM.dd-HHmmss")
 $buildTime  = $now.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$versionJson = @{ version = $versionStr; buildTime = $buildTime } | ConvertTo-Json
+
+$phraseClean = ""
+if ($Phrase) {
+    # Allow only simple ASCII tokens to avoid quoting/encoding issues across Windows shells.
+    $phraseClean = ($Phrase -replace '[^a-zA-Z0-9._-]', '').Trim()
+}
+if ($phraseClean) {
+    $versionStr = "$versionStr-$phraseClean"
+}
+
+$versionJson = @{
+    version   = $versionStr
+    buildTime = $buildTime
+    phrase    = $phraseClean
+} | ConvertTo-Json
 
 # 写入 UTF-8 无 BOM（避免 JSON.parse 失败）
 [System.IO.File]::WriteAllText("$Root\version.json", $versionJson, (New-Object System.Text.UTF8Encoding $false))

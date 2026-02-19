@@ -41,8 +41,11 @@
           :class="{ connected: isConnected }"
           :title="isConnected ? t('browserView.connected') : t('browserView.connecting')"
         ></span>
-        <span class="stats compact" :title="t('browserView.statsTooltip')">
-          <i class="fa-regular fa-clock"></i>{{ fps }} | Q{{ quality }} | <i class="fa-solid fa-arrow-down"></i>{{ formatBandwidth(bandwidth) }}
+        <span class="stats compact" :title="tr('browserView.statsTooltip2', 'Latency + decision (server): e.g. Q20x0.6')">
+          <i class="fa-regular fa-clock"></i>{{ remoteDecision.latencyMs }}ms | {{ remoteDecision.text }} | SC {{ formatFps(remoteStream.screencastFps) }}
+        </span>
+        <span v-if="isConnected && bandwidth > 0" class="stats compact" :title="tr('browserView.streamBandwidth', 'Stream downlink bandwidth')">
+          <i class="fa-solid fa-arrow-down"></i>{{ formatBandwidth(bandwidth) }}
         </span>
         <span v-if="isConnected && remoteNetwork.bytesPerSec > 0" class="stats remote-net compact" :title="t('browserView.remoteNetworkActivity')">
           <i class="fa-solid fa-network-wired"></i><i class="fa-solid fa-arrow-down"></i>{{ formatBandwidth(remoteNetwork.bytesPerSec) }}
@@ -446,6 +449,23 @@ const remoteNetwork = ref({
   requestCount: 0,
   bytesPerSec: 0,
   reqPerSec: 0
+})
+const remoteStream = ref({
+  latencyMs: 0,
+  quality: 0,
+  scale: 1,
+  decision: '',
+  screencastFps: 0,
+  allowedLatencyMs: 0
+})
+const remoteDecision = computed(() => {
+  const latencyMs = Math.max(0, Number(remoteStream.value.latencyMs || 0))
+  const q = Number(remoteStream.value.quality || quality.value || 0)
+  const scale = Number(remoteStream.value.scale || 1)
+  const text = (remoteStream.value.decision && String(remoteStream.value.decision).trim())
+    ? String(remoteStream.value.decision).trim()
+    : `Q${q}x${formatScale(scale)}`
+  return { latencyMs: latencyMs || Math.max(0, Math.round(streamLatencyMs || 0)), text }
 })
 
 // 虚拟剪贴板（HTTP 环境 fallback）
@@ -917,6 +937,16 @@ function handleMessage(message) {
     case 'network_stats':
       if (message.network) {
         remoteNetwork.value = message.network
+      }
+      if (message.stream) {
+        remoteStream.value = {
+          latencyMs: Number(message.stream.latencyMs || 0),
+          quality: Number(message.stream.quality || 0),
+          scale: Number(message.stream.scale || 1),
+          decision: String(message.stream.decision || ''),
+          screencastFps: Number(message.stream.screencastFps || 0),
+          allowedLatencyMs: Number(message.stream.allowedLatencyMs || 0)
+        }
       }
       break
 
@@ -1631,6 +1661,21 @@ function formatBandwidth(bytesPerSec) {
   if (bytesPerSec < 1024) return `${bytesPerSec}B/s`
   if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(0)}KB/s`
   return `${(bytesPerSec / (1024 * 1024)).toFixed(1)}MB/s`
+}
+
+function formatScale(value) {
+  const n = Number(value || 1)
+  if (!Number.isFinite(n)) return '1'
+  // show like 0.6 instead of 0.60, 1 instead of 1.0
+  const s = (Math.round(n * 100) / 100).toFixed(2)
+  return s.replace(/\.?0+$/, '')
+}
+
+function formatFps(value) {
+  const n = Number(value || 0)
+  if (!Number.isFinite(n) || n <= 0) return '-fps'
+  // show like "14.1fps"
+  return `${Math.round(n * 10) / 10}fps`
 }
 
 // ==================== 剪贴板辅助函数 ====================
@@ -2384,8 +2429,9 @@ function formatAge(ts) {
 }
 
 .stream-image {
-  max-width: 100%;
-  max-height: 100%;
+  /* Always fit viewport (avoid 1:1 native pixel rendering) */
+  width: 100%;
+  height: 100%;
   object-fit: contain;
   user-select: none;
   -webkit-user-drag: none;

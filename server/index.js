@@ -1160,6 +1160,28 @@ wss.on('connection', async (ws, req) => {
               }, 200);
             }
 
+            // New client: push one high-quality frame asap (best-effort, non-blocking).
+            // Screencast may currently run at lower quality due to latency adaptation; the first frame
+            // should still be crisp so the user does not see a blurry first impression.
+            (async () => {
+              try {
+                if (ws.readyState !== WebSocket.OPEN) return;
+                const client = await activePage.target().createCDPSession();
+                try { await client.send('Page.enable'); } catch (_) {}
+                const quality = 80;
+                const result = await Promise.race([
+                  client.send('Page.captureScreenshot', { format: 'jpeg', quality, fromSurface: true }),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error('HQ screenshot timeout')), 1200))
+                ]);
+                const buf = Buffer.from(result.data, 'base64');
+                if (ws.readyState !== WebSocket.OPEN) return;
+                ws.send(JSON.stringify({ type: 'frame', timestamp: Date.now(), quality, size: buf.length }));
+                ws.send(buf);
+              } catch (_) {
+                // ignore
+              }
+            })();
+
             // 设置串流死亡回调
             streamSession.onStreamDied = (reason, detail, diagnostics = {}) => {
               logger.warn(browserId, `Stream died: ${reason}`, {
@@ -1298,6 +1320,27 @@ wss.on('connection', async (ws, req) => {
 
             networkStatsTimer = setInterval(() => {
               if (ws.readyState === WebSocket.OPEN) {
+                // Heal any drift between BrowserManager active tab and StreamSession page.
+                // This can happen after browser restarts / target recreation where the WS stays connected
+                // but the underlying Puppeteer Page object has changed.
+                try {
+                  const active = browserManager.getActivePage(browserId, user.id);
+                  if (active && streamSession) {
+                    let activeTid = '';
+                    let streamTid = '';
+                    try {
+                      const t = active.target ? active.target() : null;
+                      activeTid = (t && (t._targetId || t?._targetInfo?.targetId)) || '';
+                    } catch (_) {}
+                    try {
+                      streamTid = (typeof streamSession._safeTargetId === 'function') ? (streamSession._safeTargetId() || '') : '';
+                    } catch (_) {}
+                    if (activeTid && activeTid !== streamTid) {
+                      updateActivePage(active);
+                    }
+                  }
+                } catch (_) {}
+
                 const netStats = networkMonitor ? networkMonitor.getStats() : {};
                 const strmStats = streamSession ? streamSession.getStats() : {};
                 wsSend({
@@ -1306,7 +1349,13 @@ wss.on('connection', async (ws, req) => {
                   stream: {
                     bytesSent: strmStats.bytesSent || 0,
                     framesSent: strmStats.framesSent || 0,
-                    consecutiveErrors: strmStats.consecutiveErrors || 0
+                    consecutiveErrors: strmStats.consecutiveErrors || 0,
+                    latencyMs: Number(strmStats.clientRtt || 0),
+                    quality: Number(strmStats.quality || 0),
+                    scale: Number(strmStats.scale || 1.0),
+                    decision: strmStats.decision || '',
+                    screencastFps: Number(strmStats.screencastFps || 0),
+                    allowedLatencyMs: Number(strmStats.allowedLatencyMs || 0)
                   }
                 });
               }
@@ -1423,6 +1472,10 @@ wss.on('connection', async (ws, req) => {
             item.lastPongAt = new Date(now).toISOString();
             item.wsRttMs = rtt;
             wsRuntime.set(currentWsConnKey, item);
+            // Use server-measured WS RTT for stream adaptation & UI stats (avoids clock skew).
+            if (streamSession && typeof streamSession.updateNetworkRtt === 'function') {
+              streamSession.updateNetworkRtt(rtt);
+            }
           }
           break;
         }

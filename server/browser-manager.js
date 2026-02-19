@@ -412,18 +412,36 @@ class BrowserManager {
 
   async _ensureWarmupStream(browserId, browser) {
     try {
-      const pages = await browser.pages();
-      let page = pages[0];
-      if (!page) {
-        page = await browser.newPage();
-        await page.setViewport({
-          width: config.stream.viewportWidth,
-          height: config.stream.viewportHeight
-        });
-        await this._setupAntiDetection(page);
+      const browserConfig = browserApi.getById(browserId);
+      const targetUrl = (browserConfig && browserConfig.url) ? String(browserConfig.url) : 'about:blank';
+
+      // Always create a fresh home page to avoid restoring previous tabs/pages after a shutdown/restart.
+      const page = await browser.newPage();
+      await page.setViewport({
+        width: config.stream.viewportWidth,
+        height: config.stream.viewportHeight
+      });
+      await this._setupAntiDetection(page);
+
+      if (targetUrl && targetUrl !== 'about:blank') {
+        try {
+          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        } catch (e) {
+          logger.warn(browserId, `Warmup home navigation failed: ${e.message}`);
+        }
       }
+
+      // Close all other pages best-effort to prevent stale-page carry-over.
+      try {
+        const pages = await browser.pages();
+        for (const p of pages) {
+          if (p === page) continue;
+          try { await p.close(); } catch (_) {}
+        }
+      } catch (_) {}
+
       streamService.ensureWarmupSession(browserId, page);
-      logger.info(browserId, 'Warmup stream ensured');
+      logger.info(browserId, 'Warmup home page ensured', { url: targetUrl });
     } catch (e) {
       logger.warn(browserId, `Failed to ensure warmup stream: ${e.message}`);
     }
@@ -694,7 +712,9 @@ class BrowserManager {
       // 验证至少有一个可用的 tab
       if (session.tabs.length > 0) {
         try {
-          await session.tabs[session.activeIndex].page.evaluate(() => true);
+          // NOTE: page.evaluate() may hang indefinitely when the page is in a bad state.
+          // This blocks the WS connect handshake and makes the UI look like "cannot connect".
+          await this._probePageAlive(session.tabs[session.activeIndex].page);
           this.touchBrowser(browserId);
           streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
           return session;
@@ -787,6 +807,26 @@ class BrowserManager {
     }
 
     return session;
+  }
+
+  async _probePageAlive(page, timeoutMs = 800) {
+    if (!page) throw new Error('No page');
+    const run = async () => {
+      // A trivial eval is enough to detect "Target closed"/detached.
+      await page.evaluate(() => true);
+      return true;
+    };
+    let timer = null;
+    try {
+      return await Promise.race([
+        run(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`probe timeout after ${timeoutMs}ms`)), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   // 向后兼容方法：获取用户的活跃页面
@@ -1377,21 +1417,28 @@ class BrowserManager {
       this._emitTabsUpdated(key);
       this._emitTabSwitched(key, session.activeIndex);
 
-      if (url) {
+      const browserConfig = browserApi.getById(browserId);
+      const targetUrl = url || (browserConfig && browserConfig.url) || '';
+      if (targetUrl) {
         try {
-          const browserConfig = browserApi.getById(browserId);
           const user = this._resolveUserForTabOwner(userId);
-          const check = isUrlAllowedForUser(url, browserConfig, user);
+          const check = isUrlAllowedForUser(targetUrl, browserConfig, user);
           if (check.allowed) {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            const tab = session.tabs[session.activeIndex];
-            tab.title = await page.title().catch(() => 'New Tab');
-            tab.url = page.url();
-            tab.isReady = true;
+            // Optimistically reflect the destination in tab list to avoid showing about:blank.
+            const tabRef = session.tabs[session.activeIndex];
+            tabRef.url = targetUrl;
+            tabRef.title = 'Loading...';
+            tabRef.isReady = false;
+            this._emitTabsUpdated(key);
+
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            tabRef.title = await page.title().catch(() => 'New Tab');
+            tabRef.url = page.url();
+            tabRef.isReady = true;
           } else {
             this._emitEvent(key, {
               type: 'domain_blocked',
-              blockedUrl: url,
+              blockedUrl: targetUrl,
               allowedDomains: browserConfig?.domainRestrictions || []
             });
           }
@@ -1423,9 +1470,30 @@ class BrowserManager {
     // 不关闭最后一个 tab，改为导航到空白页
     if (session.tabs.length === 1) {
       try {
-        await session.tabs[0].page.goto('about:blank');
-        session.tabs[0].title = 'New Tab';
-        session.tabs[0].url = 'about:blank';
+        const browserConfig = browserApi.getById(browserId);
+        const targetUrl = (browserConfig && browserConfig.url) ? String(browserConfig.url) : 'about:blank';
+        const user = this._resolveUserForTabOwner(userId);
+        const check = isUrlAllowedForUser(targetUrl, browserConfig, user);
+        if (check.allowed) {
+          session.tabs[0].title = 'Loading...';
+          session.tabs[0].url = targetUrl;
+          session.tabs[0].isReady = false;
+          this._emitTabsUpdated(key);
+          await session.tabs[0].page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          session.tabs[0].title = await session.tabs[0].page.title().catch(() => 'New Tab');
+          session.tabs[0].url = session.tabs[0].page.url() || targetUrl;
+          session.tabs[0].isReady = true;
+        } else {
+          await session.tabs[0].page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 10000 });
+          session.tabs[0].title = 'Blocked by domain policy';
+          session.tabs[0].url = 'about:blank';
+          session.tabs[0].isReady = true;
+          this._emitEvent(key, {
+            type: 'domain_blocked',
+            blockedUrl: targetUrl,
+            allowedDomains: browserConfig?.domainRestrictions || []
+          });
+        }
       } catch (e) {}
       this._emitTabsUpdated(key);
       streamService.ensureWarmupSession(browserId, session.tabs[0].page);
@@ -1736,6 +1804,20 @@ class BrowserManager {
     this.userSessions.delete(key);
     this.eventListeners.delete(key);
     this.touchBrowser(browserId);
+
+    // If this was the last viewer session, reset the browser to the configured home page
+    // to avoid "stuck on previous page" / blank tab issues on next entry.
+    try {
+      if (!this.hasSessionsForBrowser(browserId)) {
+        const browser = this.browsers.get(browserId);
+        if (browser && browser.isConnected && browser.isConnected()) {
+          streamService.stopWarmupSession(browserId);
+          streamService.clearLatestFrame(browserId);
+          await this._ensureWarmupStream(browserId, browser);
+        }
+      }
+    } catch (_) {}
+
     logger.info(browserId, `Shutdown finished for user ${userId}`, {
       closedTabs: tabs.length
     });

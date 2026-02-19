@@ -14,6 +14,20 @@ class StreamSession {
     this.fps = config.stream.defaultFps;
     this.interval = Math.floor(1000 / this.fps);
 
+    // Transport adaptation: quality + stream downsampling are driven primarily by latency.
+    // IMPORTANT: Do NOT change Chrome viewport resolution.
+    // Chrome stays at 720p; we downsample the streamed frames (via startScreencast maxWidth/maxHeight).
+    //
+    // Policy:
+    // - latency <= 100ms: Q80 x 1.0 (720p stream)
+    // - latency >  100ms: lower quality down to Q20 (keep scale=1.0)
+    // - if already Q20 and still high latency: drop stream scale down to 0.5 (360p), floor there.
+    this._latencyMs = 0;
+    this._highLatencyStreak = 0;
+    this._lowLatencyStreak = 0;
+    this._scale = 1.0;
+    this._desiredScale = 1.0;
+
     // 统计数据
     this.framesSent = 0;
     this.bytesSent = 0;
@@ -49,6 +63,28 @@ class StreamSession {
     // Persistent CDP session (reused across frames to avoid per-frame overhead)
     this._cdpClient = null;
 
+    // Screencast stream (event-driven) state
+    this._screencastEnabled = false;
+    this._onScreencastFrame = null;
+    this._screencastRestartTimer = null;
+    this._lastScreencastStartAt = 0;
+    this._lastScreencastRestartAt = 0;
+    this._screencastFps = 0;
+    this._screencastFpsSampleAt = Date.now();
+    this._screencastFramesSinceSample = 0;
+    this._lastScreencastProcessedAt = 0;
+
+    // Legacy capture loop guard (fallback when screencast stalls)
+    this._legacyLoopRunning = false;
+    this._legacyLoopRequested = false;
+
+    // Watchdog: prevent permanent blank/stale frames when screencast stops emitting
+    this._watchdogTimer = null;
+
+    // Effective latency threshold used by adaptation (ms)
+    // Spec: max(100ms, 1000/FPS).
+    this._allowedLatencyMs = 100;
+
     // 回调
     this.onStreamDied = null; // 串流死亡回调
     this.keepAlive = !!options.keepAlive;
@@ -83,12 +119,25 @@ class StreamSession {
 
     logger.info(this.browserId, `Stream started, userId: ${this.userId}`);
 
-    this.streamLoop();
+    // Avoid "no frames forever" after navigation/background throttling.
+    this._startWatchdog();
+
+    // Use Page.startScreencast: only produces frames when the page paints.
+    // This avoids wasting CPU/bandwidth on unchanged pages.
+    this._ensureScreencast().catch((e) => {
+      // If screencast cannot start, fall back to legacy screenshot loop.
+      logger.warn(this.browserId, `Failed to start screencast, fallback to capture loop: ${e.message}`, {
+        userId: this.userId
+      });
+      this._ensureLegacyLoop();
+    });
   }
 
   // 停止串流
   stop() {
     this.running = false;
+    this._stopWatchdog();
+    this._stopScreencast();
     this._disposeCdpClient();
     logger.info(this.browserId, `Stream stopped, userId: ${this.userId}, totalFrames: ${this.framesSent}, errors: ${this.totalErrors}`);
   }
@@ -98,15 +147,72 @@ class StreamSession {
     this.consecutiveErrors = 0;
   }
 
+  _startWatchdog() {
+    if (this._watchdogTimer) return;
+    this._watchdogTimer = setInterval(() => {
+      try {
+        if (!this.running) return;
+        // Only meaningful for live WS viewers (warmup keepAlive can be idle)
+        if (!this.ws || this.ws.readyState !== 1) return;
+        const now = Date.now();
+        const idleMs = now - Number(this.lastSuccessTime || 0);
+        if (idleMs < 2500) return;
+
+        // Prefer restarting screencast first. If it still doesn't recover, ensure legacy loop.
+        this._forceRestartScreencast('watchdog_idle');
+        if (idleMs > 8000) {
+          this._ensureLegacyLoop();
+        }
+      } catch (_) {}
+    }, 1500);
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer) {
+      clearInterval(this._watchdogTimer);
+      this._watchdogTimer = null;
+    }
+  }
+
+  _ensureLegacyLoop() {
+    if (this._legacyLoopRunning || this._legacyLoopRequested) return;
+    this._legacyLoopRequested = true;
+    this.streamLoop().catch(() => {}).finally(() => {
+      this._legacyLoopRequested = false;
+    });
+  }
+
+  _forceRestartScreencast(reason) {
+    if (!this.running) return;
+    if (!this._cdpClient) return;
+    const now = Date.now();
+    if (now - this._lastScreencastRestartAt < 2000) return;
+    this._lastScreencastRestartAt = now;
+    try { this._stopScreencast(); } catch (_) {}
+    this._ensureScreencast().catch((e) => {
+      logger.warn(this.browserId, `Force screencast restart failed (${reason}): ${e.message}`, {
+        userId: this.userId
+      });
+      this._ensureLegacyLoop();
+    });
+  }
+
+  recoverTransport(reason = 'manual') {
+    // Called by external recover requests to kick the transport even if already running.
+    this.markRecovered();
+    this._forceRestartScreencast(`recover:${reason}`);
+    this._ensureLegacyLoop();
+  }
+
   getSessionKey() {
     return `${this.browserId}_${this.userId}`;
   }
 
   // 更新客户端反馈
   updateFeedback(feedback) {
-    if (feedback.rtt !== undefined) {
-      this.clientRtt = feedback.rtt;
-    }
+    // NOTE: do not trust client-side RTT derived from frame timestamps.
+    // Server/client clocks can be skewed, causing bogus "huge latency".
+    // We update RTT from the WS ping/pong loop via updateNetworkRtt().
     if (feedback.fps !== undefined) {
       this.clientFps = feedback.fps;
     }
@@ -118,31 +224,224 @@ class StreamSession {
     this.adaptQuality();
   }
 
+  updateNetworkRtt(rttMs) {
+    const rtt = Math.max(0, Number(rttMs || 0));
+    if (!Number.isFinite(rtt)) return;
+    this.clientRtt = rtt;
+    this._latencyMs = rtt;
+    this.adaptQuality();
+  }
+
   // 自适应质量调整
   adaptQuality() {
-    const rtt = this.clientRtt;
-    const pending = this.pendingFrames;
+    const latencyMs = Number(this._latencyMs || 0);
+    if (!Number.isFinite(latencyMs) || latencyMs <= 0) return;
 
-    // 根据 RTT 和待处理帧数调整
-    if (rtt > 300 || pending > 5) {
-      // 网络差，降低质量和帧率
-      this.quality = Math.max(config.stream.minQuality, this.quality - 10);
-      this.fps = Math.max(config.stream.minFps, this.fps - 2);
-    } else if (rtt > 150 || pending > 2) {
-      // 网络一般，轻微降低
-      this.quality = Math.max(config.stream.minQuality, this.quality - 5);
-      this.fps = Math.max(config.stream.minFps, this.fps - 1);
-    } else if (rtt < 80 && pending === 0) {
-      // 网络好，提升质量
-      this.quality = Math.min(config.stream.maxQuality, this.quality + 5);
-      this.fps = Math.min(config.stream.maxFps, this.fps + 1);
+    // Use client-reported display FPS if available; it reflects real delivery/paint on the viewer.
+    const effectiveFps = Math.max(1, Number(this.clientFps || 0) || Number(this.fps || 15));
+    const LOW_LATENCY_MS = Math.max(100, Math.round(1000 / effectiveFps));
+    this._allowedLatencyMs = LOW_LATENCY_MS;
+    const QUALITY_GOOD = 80;
+    const QUALITY_MIN = 20;
+    const SCALE_GOOD = 1.0;
+    const SCALE_MIN = 0.5;
+
+    if (latencyMs <= LOW_LATENCY_MS) {
+      this._highLatencyStreak = 0;
+      this._lowLatencyStreak += 1;
+
+      // Snap back to the desired quality when latency is good.
+      this.quality = QUALITY_GOOD;
+      this.quality = Math.min(config.stream.maxQuality, Math.max(config.stream.minQuality, this.quality));
+
+      // Restore scale after a small streak to avoid flapping around the threshold.
+      if (this._lowLatencyStreak >= 2) {
+        this._setDesiredScale(SCALE_GOOD);
+      }
+    } else {
+      this._lowLatencyStreak = 0;
+      this._highLatencyStreak += 1;
+
+      // Step down quality until it reaches Q20.
+      if (this.quality > QUALITY_MIN) {
+        const step = 5;
+        this.quality = Math.max(QUALITY_MIN, this.quality - step);
+      }
+
+      // If we're already at minimum quality and still high latency, reduce stream scale to 360p.
+      if (this.quality <= QUALITY_MIN && this._highLatencyStreak >= 2) {
+        this._setDesiredScale(SCALE_MIN);
+      }
     }
 
+    // Keep FPS stable (avoid dropping to Q20 due to pending frames alone).
     this.interval = Math.floor(1000 / this.fps);
+
+    // Restart screencast when quality/viewport target changes (throttled).
+    this._scheduleScreencastRestart();
+  }
+
+  _setDesiredScale(value) {
+    const n = Number(value || 1);
+    if (!Number.isFinite(n) || n <= 0) return;
+    const clamped = Math.max(0.5, Math.min(1.0, n));
+    this._desiredScale = clamped;
+  }
+
+  _getScreencastDims() {
+    const baseW = Number(config.stream.viewportWidth || 1280);
+    const baseH = Number(config.stream.viewportHeight || 720);
+    // Apply desired scale but do NOT change the underlying Chrome viewport.
+    const scale = Math.max(0.5, Math.min(1.0, Number(this._desiredScale || 1)));
+    const w = Math.max(320, Math.floor(baseW * scale));
+    const h = Math.max(180, Math.floor(baseH * scale));
+    // Track applied scale used for this screencast stream.
+    this._scale = scale;
+    return { maxWidth: w, maxHeight: h, scale };
+  }
+
+  async _ensureScreencast() {
+    if (this._screencastEnabled) return;
+    if (!this.page) throw new Error('No page');
+    // Create CDP session if needed
+    if (!this._cdpClient) {
+      this._cdpClient = await this.page.target().createCDPSession();
+    }
+    const client = this._cdpClient;
+
+    // Make sure Page domain is available
+    try { await client.send('Page.enable'); } catch (_) {}
+
+    // Register event handler once
+    this._onScreencastFrame = async (params) => {
+      if (!this.running) return;
+      try {
+        // Always ACK to keep frames flowing
+        const sid = params && params.sessionId;
+        if (sid) {
+          try { await client.send('Page.screencastFrameAck', { sessionId: sid }); } catch (_) {}
+        }
+
+        const dataB64 = params && params.data;
+        if (!dataB64) return;
+        const now = Date.now();
+
+        // Screencast FPS is the paint-driven rate of Chrome->server frames.
+        this._screencastFramesSinceSample += 1;
+        const dt = now - this._screencastFpsSampleAt;
+        if (dt >= 1000) {
+          this._screencastFps = Number(((this._screencastFramesSinceSample * 1000) / dt).toFixed(1));
+          this._screencastFramesSinceSample = 0;
+          this._screencastFpsSampleAt = now;
+        }
+
+        // High-refresh pages can paint at 60+ fps; do not decode+push every paint frame.
+        // We keep Chrome sending frames (ACK always), but only process at target FPS.
+        const targetFps = Math.max(1, Number(this.fps || 15));
+        const minIntervalMs = Math.max(1, Math.floor(1000 / targetFps));
+        if (this._lastScreencastProcessedAt && (now - this._lastScreencastProcessedAt) < minIntervalMs) {
+          return;
+        }
+        this._lastScreencastProcessedAt = now;
+
+        const buf = Buffer.from(dataB64, 'base64');
+
+        if (this.onFrame) {
+          try {
+            this.onFrame(buf, { timestamp: now, quality: this.quality, size: buf.length });
+          } catch (_) {}
+        }
+
+        // If the client can't keep up, drop delivery (keep latest frame updated via onFrame).
+        const MAX_WS_BUFFERED = 3 * 1024 * 1024; // 3MB
+        const canSend = !!(this.ws && this.ws.readyState === 1 && (this.ws.bufferedAmount || 0) < MAX_WS_BUFFERED);
+        if (canSend) {
+          this.ws.send(JSON.stringify({
+            type: 'frame',
+            timestamp: now,
+            quality: this.quality,
+            size: buf.length
+          }));
+          this.ws.send(buf);
+          this.framesSent++;
+          this.bytesSent += buf.length;
+        }
+        this.lastFrameTime = now;
+        this.lastSuccessTime = now;
+        if (!this.firstFrameAt) this.firstFrameAt = now;
+        this.consecutiveErrors = 0;
+      } catch (e) {
+        this.totalErrors++;
+        this.consecutiveErrors++;
+        const errorMessage = (e && typeof e.message === 'string') ? e.message : String(e);
+        const errorType = this._classifyStreamError(errorMessage);
+        if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+          this.running = false;
+          this._stopScreencast();
+          this.onStreamDied && this.onStreamDied('too_many_errors', errorMessage, {
+            errorType,
+            totalErrors: this.totalErrors,
+            consecutiveErrors: this.consecutiveErrors
+          });
+        }
+      }
+    };
+    client.on('Page.screencastFrame', this._onScreencastFrame);
+
+    const dims = this._getScreencastDims();
+    await client.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: Math.max(0, Math.min(100, Number(this.quality || 80))),
+      maxWidth: dims.maxWidth,
+      maxHeight: dims.maxHeight,
+      everyNthFrame: 1
+    });
+
+    this._screencastEnabled = true;
+    this._lastScreencastStartAt = Date.now();
+  }
+
+  _stopScreencast() {
+    if (this._screencastRestartTimer) {
+      clearTimeout(this._screencastRestartTimer);
+      this._screencastRestartTimer = null;
+    }
+    if (!this._screencastEnabled) return;
+    this._screencastEnabled = false;
+    const client = this._cdpClient;
+    if (client) {
+      try { client.send('Page.stopScreencast').catch(() => {}); } catch (_) {}
+      if (this._onScreencastFrame) {
+        try { client.off('Page.screencastFrame', this._onScreencastFrame); } catch (_) {}
+      }
+    }
+    this._onScreencastFrame = null;
+  }
+
+  _scheduleScreencastRestart() {
+    if (!this._screencastEnabled) return;
+    if (this._screencastRestartTimer) return;
+    // Throttle restarts (quality may adjust often)
+    const now = Date.now();
+    if (now - this._lastScreencastStartAt < 2500) return;
+    this._screencastRestartTimer = setTimeout(async () => {
+      this._screencastRestartTimer = null;
+      if (!this.running) return;
+      // Restart to apply quality / dimension changes.
+      try {
+        this._stopScreencast();
+        await this._ensureScreencast();
+      } catch (e) {
+        logger.warn(this.browserId, `Screencast restart failed: ${e.message}`, { userId: this.userId });
+      }
+    }, 350);
   }
 
   // 串流循环
   async streamLoop() {
+    if (this._legacyLoopRunning) return;
+    this._legacyLoopRunning = true;
+    this._legacyLoopRequested = false;
     while (this.running && (this.keepAlive || (this.ws && this.ws.readyState === 1))) { // WebSocket.OPEN = 1
       const startTime = Date.now();
 
@@ -368,6 +667,7 @@ class StreamSession {
         throw e; // second attempt also failed, page is truly gone
       }
     }
+    this._legacyLoopRunning = false;
   }
 
   async captureWithTimeout() {
@@ -479,9 +779,14 @@ class StreamSession {
       avgBandwidthBps,
       avgOutputFps,
       chromeFps: this.chromeFps || 0,
+      screencastFps: Number(this._screencastFps || 0),
       quality: this.quality,
       fps: this.fps,
       clientRtt: this.clientRtt,
+      allowedLatencyMs: Number(this._allowedLatencyMs || 100),
+      scale: Number(this._scale || 1.0),
+      desiredScale: Number(this._desiredScale || 1.0),
+      decision: `Q${Number(this.quality || 0)}x${Number(this._scale || 1.0).toFixed(2)}`,
       streamTargetId: this._safeTargetId(),
       streamPageUrl: this._safePageUrl(),
       consecutiveErrors: this.consecutiveErrors,
@@ -512,6 +817,10 @@ class StreamService {
     if (this.sessions.has(key)) {
       this.sessions.get(key).stop();
     }
+
+    // Warmup is only for "no viewer" cases; stop it once a real viewer session exists,
+    // otherwise it can overwrite latestFrames with stale/other pages.
+    this.stopWarmupSession(browserId);
 
     const session = new StreamSession(page, ws, userId, browserId, {
       keepAlive: false,
@@ -658,10 +967,9 @@ class StreamService {
     if (!session) return { ok: false, error: 'Stream session not found' };
     if (!page) return { ok: false, error: 'No active page to recover' };
     session.setPage(page);
-    session.markRecovered();
-    if (!session.running) {
-      session.start();
-    }
+    if (!session.running) session.start();
+    // Even if running, restart transport to avoid being stuck with no frames.
+    session.recoverTransport('api');
     return { ok: true };
   }
 }
