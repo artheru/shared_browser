@@ -510,6 +510,11 @@ const wsDebug = ref({
 // 鼠标按下追踪（确保 mouseup 只在 mousedown 来自串流区域时才发送）
 let mouseDownInStream = false
 
+// Stream source resolution (server-side virtual coordinates)
+const STREAM_W = 1280
+const STREAM_H = 720
+const STREAM_ASPECT = STREAM_W / STREAM_H
+
 // 聚焦到串流区域（只在点击串流容器内部时触发，不从工具栏/标签栏抢焦点）
 function focusStream(event) {
   if (!streamContainer.value) return
@@ -1066,14 +1071,14 @@ function updateRemoteCursorOverlay() {
   }
 
   const containerRect = streamContainer.value.getBoundingClientRect()
-  const imageRect = streamImage.value.getBoundingClientRect()
-  if (!imageRect.width || !imageRect.height) {
+  const contentRect = getStreamContentRect()
+  if (!contentRect || !contentRect.width || !contentRect.height) {
     remoteCursorStyle.value = { display: 'none' }
     return
   }
 
-  const left = (remoteCursor.value.x / 1280) * imageRect.width + (imageRect.left - containerRect.left)
-  const top = (remoteCursor.value.y / 720) * imageRect.height + (imageRect.top - containerRect.top)
+  const left = (remoteCursor.value.x / STREAM_W) * contentRect.width + (contentRect.left - containerRect.left)
+  const top = (remoteCursor.value.y / STREAM_H) * contentRect.height + (contentRect.top - containerRect.top)
   remoteCursorStyle.value = {
     display: 'block',
     left: `${left}px`,
@@ -1152,21 +1157,67 @@ function respondDialog(accept) {
 
 // ==================== 鼠标坐标转换 ====================
 
-function getRelativeCoords(event) {
+function getStreamContentRect() {
   const img = streamImage.value
-  if (!img) return { x: 0, y: 0 }
+  if (!img) return null
+  const rect = img.getBoundingClientRect()
+  const boxW = rect.width || 0
+  const boxH = rect.height || 0
+  if (boxW <= 1 || boxH <= 1) return null
 
-  const imgRect = img.getBoundingClientRect()
+  // Because the <img> box is stretched to 100% of the container while using object-fit: contain,
+  // the "real video content" is letterboxed inside the element box. We must compute that content box
+  // to map pointer coordinates correctly.
+  const boxAspect = boxW / boxH
+  let contentW = boxW
+  let contentH = boxH
+  let offsetX = 0
+  let offsetY = 0
 
-  const x = event.clientX - imgRect.left
-  const y = event.clientY - imgRect.top
-
-  const scaleX = 1280 / imgRect.width
-  const scaleY = 720 / imgRect.height
+  if (boxAspect > STREAM_ASPECT) {
+    // Wider than stream: pillarbox (left/right bars)
+    contentH = boxH
+    contentW = boxH * STREAM_ASPECT
+    offsetX = (boxW - contentW) / 2
+  } else {
+    // Taller than stream: letterbox (top/bottom bars)
+    contentW = boxW
+    contentH = boxW / STREAM_ASPECT
+    offsetY = (boxH - contentH) / 2
+  }
 
   return {
-    x: Math.max(0, Math.min(1280, Math.round(x * scaleX))),
-    y: Math.max(0, Math.min(720, Math.round(y * scaleY)))
+    left: rect.left + offsetX,
+    top: rect.top + offsetY,
+    width: contentW,
+    height: contentH
+  }
+}
+
+function getRelativeCoords(event, options = {}) {
+  const allowOutside = !!options.allowOutside
+  const contentRect = getStreamContentRect()
+  if (!contentRect) return null
+
+  let localX = event.clientX - contentRect.left
+  let localY = event.clientY - contentRect.top
+
+  const outside = localX < 0 || localY < 0 || localX > contentRect.width || localY > contentRect.height
+  if (outside && !allowOutside) {
+    // Clicking on the black bars should not send input to the remote browser.
+    return null
+  }
+
+  // When dragging, clamp to the content bounds so mouseup still lands correctly.
+  localX = Math.max(0, Math.min(contentRect.width, localX))
+  localY = Math.max(0, Math.min(contentRect.height, localY))
+
+  const scaleX = STREAM_W / contentRect.width
+  const scaleY = STREAM_H / contentRect.height
+
+  return {
+    x: Math.max(0, Math.min(STREAM_W, Math.round(localX * scaleX))),
+    y: Math.max(0, Math.min(STREAM_H, Math.round(localY * scaleY)))
   }
 }
 
@@ -1184,7 +1235,9 @@ function handleMouseMove(event) {
   const now = performance.now()
   if (now - lastMouseMoveSentAt < 16) return
   lastMouseMoveSentAt = now
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: mouseDownInStream })
+  if (!coords) return
+  const { x, y } = coords
   sendInput({ type: 'mousemove', x, y })
 }
 
@@ -1196,7 +1249,12 @@ function handleMouseDown(event) {
   }
   if (event.button === 1) event.preventDefault()
   mouseDownInStream = true
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: false })
+  if (!coords) {
+    mouseDownInStream = false
+    return
+  }
+  const { x, y } = coords
   sendInput({ type: 'mousedown', x, y, button: event.button })
 }
 
@@ -1205,7 +1263,9 @@ function handleMouseUp(event) {
   // 只有当 mousedown 发生在串流区域时才发送 mouseup
   if (!mouseDownInStream) return
   mouseDownInStream = false
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: true })
+  if (!coords) return
+  const { x, y } = coords
   sendInput({ type: 'mouseup', x, y, button: event.button })
   if (event.button === 1) {
     // 中键打开新标签时主动拉取一次 tab 列表，避免 UI 不刷新
@@ -1226,19 +1286,25 @@ function handleAuxClick(event) {
 function handleWheel(event) {
   if (!isConnected.value) return
   event.preventDefault()
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: mouseDownInStream })
+  if (!coords) return
+  const { x, y } = coords
   sendInput({ type: 'wheel', x, y, deltaX: event.deltaX, deltaY: event.deltaY })
 }
 
 function handleContextMenu(event) {
   if (!isConnected.value) return
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: false })
+  if (!coords) return
+  const { x, y } = coords
   sendInput({ type: 'contextmenu', x, y })
 }
 
 function handleDoubleClick(event) {
   if (!isConnected.value) return
-  const { x, y } = getRelativeCoords(event)
+  const coords = getRelativeCoords(event, { allowOutside: false })
+  if (!coords) return
+  const { x, y } = coords
   sendInput({ type: 'dblclick', x, y })
 }
 

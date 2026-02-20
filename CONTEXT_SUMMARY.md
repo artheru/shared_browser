@@ -21,4 +21,5 @@
   - Remote deploy: pushed updated server JS via VehicleHelper file upload + restarted node via remote GUI keyboard.
 - Deploy verification improvement: `build.ps1` supports embedding a phrase into `version.json` (e.g. `jackie`) so `/api/version` can confirm the correct build is running. Remote updated and verified: `2026.02.19-050408-jackie`.
 - Default page behavior: new tab and "close last tab" now navigate to the browser's configured default URL (instead of leaving the user on `about:blank`). Deployed and verified with phrase: `2026.02.19-051225-jackie2`.
+- Input coordinate fix: mouse coordinates are now computed from the actual stream content box (excluding letterbox/pillarbox bars under `object-fit: contain`), preventing click/move offset when the stream does not fill the container. Deployed and verified with phrase: `2026.02.20-070835-jackie3` (evidence: `ai-deck/tmp/deploy-verify-20260220-070835-jackie3/`).
 

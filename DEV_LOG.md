@@ -164,3 +164,14 @@
 - Remote deploy:
   - Built with phrase: `jackie2`
   - Verified: `GET /api/version` shows `2026.02.19-051225-jackie2` + `phrase=jackie2`
+
+## 2026-02-20 Mouse coordinate offset fix (jackie3)
+- Symptom: when the stream is displayed with `object-fit: contain` and the container has letterbox/pillarbox bars, mouse coordinates were computed from the container/element box instead of the actual painted content, causing input offset.
+- Fix: `client/src/views/BrowserView.vue`
+  - compute stream content rect inside the `<img>` box based on fixed stream aspect (1280x720)
+  - map mouse events using the content rect; ignore clicks on black bars; clamp moves while dragging
+  - apply the same content rect logic to the remote cursor overlay
+- Remote deploy:
+  - Built with phrase: `jackie3`
+  - Verified: `GET /api/version` shows `2026.02.20-070835-jackie3` + `phrase=jackie3`
+  - Evidence: `ai-deck/tmp/deploy-verify-20260220-070835-jackie3/01-before.png`, `02-after.png`
