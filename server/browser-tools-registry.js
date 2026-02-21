@@ -21,6 +21,34 @@ const TOOL_DEFINITIONS = [
     apiMethod: 'POST'
   },
   {
+    id: 'tabs_list',
+    name: 'Tabs List',
+    description: 'List tabs and current active tab index',
+    mcpPath: 'tabs',
+    apiMethod: 'GET'
+  },
+  {
+    id: 'tabs_select',
+    name: 'Tabs Select',
+    description: 'Switch active tab by index',
+    mcpPath: 'tabs/select',
+    apiMethod: 'POST'
+  },
+  {
+    id: 'tabs_new',
+    name: 'Tabs New',
+    description: 'Create a new tab (default URL when omitted)',
+    mcpPath: 'tabs/new',
+    apiMethod: 'POST'
+  },
+  {
+    id: 'tabs_close',
+    name: 'Tabs Close',
+    description: 'Close tab by index (last tab falls back to default URL)',
+    mcpPath: 'tabs/close',
+    apiMethod: 'POST'
+  },
+  {
     id: 'downloads',
     name: 'Downloads',
     description: 'List files downloaded by remote browser sessions',

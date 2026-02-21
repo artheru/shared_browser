@@ -22,4 +22,6 @@
 - Deploy verification improvement: `build.ps1` supports embedding a phrase into `version.json` (e.g. `jackie`) so `/api/version` can confirm the correct build is running. Remote updated and verified: `2026.02.19-050408-jackie`.
 - Default page behavior: new tab and "close last tab" now navigate to the browser's configured default URL (instead of leaving the user on `about:blank`). Deployed and verified with phrase: `2026.02.19-051225-jackie2`.
 - Input coordinate fix: mouse coordinates are now computed from the actual stream content box (excluding letterbox/pillarbox bars under `object-fit: contain`), preventing click/move offset when the stream does not fill the container. Deployed and verified with phrase: `2026.02.20-070835-jackie3` (evidence: `ai-deck/tmp/deploy-verify-20260220-070835-jackie3/`).
+- MCP server fix: implemented MCP JSON-RPC endpoint at `/api/mcp/:browserId` with `initialize`, `ping`, `tools/list`, `tools/call` (auth-required HTTP transport). Deployed and verified on `http://192.168.0.190:3000/api/mcp/test` with phrase `jackie4`.
+- MCP usability enhancement: added clear parameter descriptions in MCP tool schemas and added tab control tools for both MCP and API (`tabs_list`, `tabs_select`, `tabs_new`, `tabs_close`). Deployed and verified with phrase `jackie5`.
 

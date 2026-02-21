@@ -175,3 +175,49 @@
   - Built with phrase: `jackie3`
   - Verified: `GET /api/version` shows `2026.02.20-070835-jackie3` + `phrase=jackie3`
   - Evidence: `ai-deck/tmp/deploy-verify-20260220-070835-jackie3/01-before.png`, `02-after.png`
+
+## 2026-02-21 MCP JSON-RPC server endpoint fix (jackie4)
+- Symptom: direct MCP endpoint `http://192.168.0.190:3000/api/mcp/test` was not usable as a standard MCP server route.
+- Implemented in `server/index.js`:
+  - `GET /api/mcp/:browserId` returns endpoint metadata/hint for MCP client setup
+  - `POST /api/mcp/:browserId` handles JSON-RPC methods:
+    - `initialize`
+    - `ping`
+    - `tools/list`
+    - `tools/call`
+  - Added MCP tool gating by `toolAccess.*.mcpEnabled` (`ensureMcpToolEnabled`)
+  - Added MCP tool adapters to existing services (`mcpService`, `fileService`) with structured MCP responses
+- Remote deploy:
+  - Built with phrase: `jackie4`
+  - Verified: `GET /api/version` => `2026.02.21-044227-jackie4`, `phrase=jackie4`
+- Remote MCP verification:
+  - `GET /api/mcp/test` works (with bearer token)
+  - `POST /api/mcp/test` `initialize` returns server info/version
+  - `tools/list` returns 8 tools
+  - `tools/call` (`dev_html`) returns content + structuredContent
+
+## 2026-02-21 MCP parameter descriptions + tab tools (jackie5)
+- Request:
+  - MCP tool parameter descriptions should be explicit (no `No description` in client UI).
+  - AI must be able to access/select tabs through both MCP and WebAPI endpoints.
+- Implemented:
+  - `server/index.js`
+    - enriched `getMcpToolSchemas()` with `description` for tool parameters (pointer/input/dev_console/dev_eval/etc.)
+    - added MCP schemas for `tabs_list`, `tabs_select`, `tabs_new`, `tabs_close`
+    - extended MCP `tools/call` dispatcher to support tab operations via `browserManager`
+    - added WebAPI routes:
+      - `GET /api/mcp/:browserId/tabs`
+      - `POST /api/mcp/:browserId/tabs/select`
+      - `POST /api/mcp/:browserId/tabs/new`
+      - `POST /api/mcp/:browserId/tabs/close`
+  - `server/browser-tools-registry.js`
+    - registered 4 new tools with route metadata
+- Remote deploy:
+  - Built with phrase: `jackie5`
+  - Verified: `GET /api/version` => `2026.02.21-045646-jackie5`, `phrase=jackie5`
+- Remote functional verification:
+  - MCP `tools/list` contains `tabs_list/tabs_select/tabs_new/tabs_close`
+  - MCP schema now returns parameter descriptions (e.g., pointer fields, `tabIndex` description)
+  - MCP tab flow works (`tabs_list -> tabs_new -> tabs_select -> tabs_close`)
+  - WebAPI tab routes work (`/api/mcp/test/tabs` and `/tabs/select`)
+  - MCP loop evidence: `ai-deck/tmp/deploy-verify-20260221-045646-jackie5/01-before.png`, `02-after.png`

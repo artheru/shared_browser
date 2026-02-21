@@ -595,6 +595,16 @@ function ensureToolEnabled(res, browser, toolId) {
   return true;
 }
 
+function ensureMcpToolEnabled(res, browser, toolId) {
+  const access = normalizeToolAccess(browser.toolAccess);
+  const tool = access[toolId];
+  if (!tool || !tool.mcpEnabled) {
+    res.status(403).json({ error: `MCP disabled for tool: ${toolId}` });
+    return false;
+  }
+  return true;
+}
+
 function inferCallSource(req) {
   const sessionHeader = req.get('mcp-session-id') || req.get('x-mcp-session-id') || req.get('x-mcp-session');
   const userAgent = String(req.get('user-agent') || '').toLowerCase();
@@ -670,6 +680,312 @@ function logToolCallError(callCtx, err) {
   });
 }
 
+function makeJsonRpcResult(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function makeJsonRpcError(id, code, message, data) {
+  return {
+    jsonrpc: '2.0',
+    id: id ?? null,
+    error: {
+      code,
+      message,
+      ...(data !== undefined ? { data } : {})
+    }
+  };
+}
+
+function makeToolResultContent(data) {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(data)
+      }
+    ],
+    structuredContent: data
+  };
+}
+
+function getMcpToolSchemas() {
+  return {
+    screenshot: {
+      type: 'object',
+      properties: {
+        fullPage: { type: 'boolean', description: 'Capture full page (true) or viewport only (false).' },
+        useLiveFrame: { type: 'boolean', description: 'Prefer latest stream frame cache when available.' }
+      },
+      additionalProperties: true
+    },
+    pointer: {
+      type: 'object',
+      properties: {
+        start: { type: 'object', description: 'Start point: {x, y} in page viewport coordinates.' },
+        end: { type: 'object', description: 'End point for drag/move: {x, y}.' },
+        startSelector: { type: 'string', description: 'CSS selector to resolve start point center.' },
+        endSelector: { type: 'string', description: 'CSS selector to resolve end point center.' },
+        button: { type: 'string', description: 'Mouse button: left/right/middle.' },
+        clickAtEnd: { type: 'boolean', description: 'Click at end point after move.' },
+        clickCount: { type: 'number', description: 'Click count when clickAtEnd=true.' },
+        pressAtStart: { type: 'boolean', description: 'Press mouse button down at start.' },
+        releaseAtEnd: { type: 'boolean', description: 'Release mouse button at end.' },
+        wheelDeltaX: { type: 'number', description: 'Horizontal wheel delta.' },
+        wheelDeltaY: { type: 'number', description: 'Vertical wheel delta.' },
+        steps: { type: 'number', description: 'Interpolation steps for mouse move.' }
+      },
+      additionalProperties: true
+    },
+    input: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to type.' },
+        selector: { type: 'string', description: 'Optional CSS selector to focus before typing.' },
+        clearBefore: { type: 'boolean', description: 'Clear target value/content before typing.' },
+        delayMs: { type: 'number', description: 'Delay between keystrokes in milliseconds.' },
+        pressEnter: { type: 'boolean', description: 'Press Enter after typing.' }
+      },
+      additionalProperties: true
+    },
+    tabs_list: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    tabs_select: {
+      type: 'object',
+      properties: {
+        tabIndex: { type: 'number', description: 'Target tab index to activate.' }
+      },
+      required: ['tabIndex'],
+      additionalProperties: true
+    },
+    tabs_new: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Optional URL. When omitted, browser default URL is used.' }
+      },
+      additionalProperties: true
+    },
+    tabs_close: {
+      type: 'object',
+      properties: {
+        tabIndex: { type: 'number', description: 'Tab index to close.' }
+      },
+      required: ['tabIndex'],
+      additionalProperties: true
+    },
+    downloads: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    downloads_state: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    dev_html: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    dev_console: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Maximum console entries to return.' }
+      },
+      additionalProperties: true
+    },
+    dev_eval: {
+      type: 'object',
+      properties: {
+        script: { type: 'string', description: 'JavaScript source code to execute in page context.' }
+      },
+      required: ['script'],
+      additionalProperties: true
+    }
+  };
+}
+
+function buildMcpToolsForBrowser(browser) {
+  const access = normalizeToolAccess(browser.toolAccess);
+  const schemas = getMcpToolSchemas();
+  return TOOL_DEFINITIONS
+    .filter((tool) => {
+      const conf = access[tool.id];
+      return !!(conf && conf.mcpEnabled);
+    })
+    .map((tool) => ({
+      name: tool.id,
+      description: tool.description,
+      inputSchema: schemas[tool.id] || { type: 'object', properties: {}, additionalProperties: true }
+    }));
+}
+
+async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
+  switch (toolName) {
+    case 'screenshot':
+      return await mcpService.screenshot(browserId, args || {}, userId);
+    case 'pointer':
+      return await mcpService.pointerAction(browserId, args || {}, userId);
+    case 'input':
+      return await mcpService.inputText(browserId, args || {}, userId);
+    case 'tabs_list':
+      return browserManager.getTabList(browserId, userId);
+    case 'tabs_select': {
+      const tabIndex = Number(args?.tabIndex);
+      if (!Number.isFinite(tabIndex)) throw new Error('tabIndex is required');
+      const page = await browserManager.switchTab(browserId, userId, tabIndex);
+      if (!page) throw new Error(`Failed to switch tab: ${tabIndex}`);
+      return browserManager.getTabList(browserId, userId);
+    }
+    case 'tabs_new': {
+      const page = await browserManager.createNewTab(browserId, userId, args?.url);
+      if (!page) throw new Error('Failed to create new tab');
+      return browserManager.getTabList(browserId, userId);
+    }
+    case 'tabs_close': {
+      const tabIndex = Number(args?.tabIndex);
+      if (!Number.isFinite(tabIndex)) throw new Error('tabIndex is required');
+      await browserManager.closeTab(browserId, userId, tabIndex);
+      return browserManager.getTabList(browserId, userId);
+    }
+    case 'downloads':
+      return await mcpService.listDownloads(browserId);
+    case 'downloads_state': {
+      const files = fileService.getDownloadedFiles(browserId, userId);
+      const active = fileService.getActiveDownloads(browserId, userId);
+      return { files, active };
+    }
+    case 'dev_html':
+      return await mcpService.getHtml(browserId, userId);
+    case 'dev_console': {
+      const limit = Number(args?.limit || 200);
+      return mcpService.getConsole(browserId, limit);
+    }
+    case 'dev_eval': {
+      const script = String(args?.script || '');
+      if (!script) throw new Error('script is required');
+      return await mcpService.evalJs(browserId, script, userId);
+    }
+    default:
+      throw new Error(`Unknown tool: ${toolName}`);
+  }
+}
+
+// MCP JSON-RPC endpoint (single-route MCP server for each browserId)
+app.get(`${config.mcp.routePrefix}/:browserId`, authMiddleware, (req, res) => {
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browserId = req.params.browserId;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!browser.mcpEnabled) return res.status(403).json({ error: 'MCP disabled for this browser' });
+
+    res.json({
+      name: 'shared-browser-mcp',
+      browserId,
+      endpoint: getMcpEndpoint(req, browserId),
+      transport: 'http',
+      protocol: 'jsonrpc-2.0',
+      hint: 'Use POST with MCP JSON-RPC methods: initialize, tools/list, tools/call',
+      example: {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {}
+        }
+      }
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res) => {
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browserId = req.params.browserId;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!browser.mcpEnabled) return res.status(403).json({ error: 'MCP disabled for this browser' });
+
+    const body = req.body;
+    if (!body || Array.isArray(body) || body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
+      return res.status(400).json(makeJsonRpcError(body?.id ?? null, -32600, 'Invalid Request'));
+    }
+
+    const method = body.method;
+    const id = body.id ?? null;
+    const params = body.params || {};
+
+    if (method === 'initialize') {
+      return res.json(makeJsonRpcResult(id, {
+        protocolVersion: params.protocolVersion || '2024-11-05',
+        capabilities: {
+          tools: {}
+        },
+        serverInfo: {
+          name: 'shared-browser-mcp',
+          version: String(versionInfo.version || 'unknown')
+        }
+      }));
+    }
+
+    if (method === 'notifications/initialized') {
+      return res.json(makeJsonRpcResult(id, {}));
+    }
+
+    if (method === 'ping') {
+      return res.json(makeJsonRpcResult(id, {}));
+    }
+
+    if (method === 'tools/list') {
+      const tools = buildMcpToolsForBrowser(browser);
+      return res.json(makeJsonRpcResult(id, { tools }));
+    }
+
+    if (method === 'tools/call') {
+      const toolName = String(params.name || '');
+      if (!toolName) {
+        return res.status(400).json(makeJsonRpcError(id, -32602, 'Invalid params: name is required'));
+      }
+      if (!ensureMcpToolEnabled(res, browser, toolName)) return;
+      const callCtx = {
+        start: Date.now(),
+        entry: {
+          source: 'mcp',
+          method: 'POST',
+          path: req.originalUrl,
+          browserId,
+          tool: toolName,
+          user: req.user?.username,
+          request: {
+            params: req.params,
+            query: req.query,
+            body
+          }
+        }
+      };
+      try {
+        const data = await executeMcpToolCall(browserId, req.user.id, toolName, params.arguments || {});
+        logToolCallOk(callCtx, data);
+        return res.json(makeJsonRpcResult(id, makeToolResultContent(data)));
+      } catch (e) {
+        logToolCallError(callCtx, e);
+        return res.status(400).json(makeJsonRpcError(id, -32000, e.message || String(e)));
+      }
+    }
+
+    return res.status(400).json(makeJsonRpcError(id, -32601, `Method not found: ${method}`));
+  } catch (e) {
+    return res.status(500).json(makeJsonRpcError(req.body?.id ?? null, -32000, e.message || String(e)));
+  }
+});
+
 app.post(`${config.mcp.routePrefix}/:browserId/screenshot`, authMiddleware, async (req, res) => {
   const browserId = req.params.browserId;
   const callCtx = logToolCallStart(req, browserId, 'screenshot');
@@ -727,6 +1043,88 @@ app.post(`${config.mcp.routePrefix}/:browserId/input`, authMiddleware, async (re
     if (!ensureToolEnabled(res, browser, 'input')) return;
 
     const data = await mcpService.inputText(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/tabs`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'tabs_list');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'tabs_list')) return;
+
+    const data = browserManager.getTabList(browserId, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/tabs/select`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'tabs_select');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'tabs_select')) return;
+
+    const tabIndex = Number(req.body?.tabIndex);
+    if (!Number.isFinite(tabIndex)) return res.status(400).json({ error: 'tabIndex is required' });
+    const page = await browserManager.switchTab(browserId, req.user.id, tabIndex);
+    if (!page) return res.status(400).json({ error: `Failed to switch tab: ${tabIndex}` });
+    const data = browserManager.getTabList(browserId, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/tabs/new`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'tabs_new');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'tabs_new')) return;
+
+    const data = await executeMcpToolCall(browserId, req.user.id, 'tabs_new', { url: req.body?.url });
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/tabs/close`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'tabs_close');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'tabs_close')) return;
+
+    const tabIndex = Number(req.body?.tabIndex);
+    if (!Number.isFinite(tabIndex)) return res.status(400).json({ error: 'tabIndex is required' });
+    const data = await executeMcpToolCall(browserId, req.user.id, 'tabs_close', { tabIndex });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
