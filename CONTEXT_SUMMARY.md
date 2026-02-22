@@ -25,3 +25,84 @@
 - MCP server fix: implemented MCP JSON-RPC endpoint at `/api/mcp/:browserId` with `initialize`, `ping`, `tools/list`, `tools/call` (auth-required HTTP transport). Deployed and verified on `http://192.168.0.190:3000/api/mcp/test` with phrase `jackie4`.
 - MCP usability enhancement: added clear parameter descriptions in MCP tool schemas and added tab control tools for both MCP and API (`tabs_list`, `tabs_select`, `tabs_new`, `tabs_close`). Deployed and verified with phrase `jackie5`.
 
+## 2026-02-22
+- Added AI video recording feature set for MCP/WebAPI:
+  - `start_video_recording` (blocking until MP4 is ready, requires `durationSec`, max 15s hard cap with admin-configurable limit)
+  - `list_recorded_videos` (lists available `fileId`s)
+  - `fetch_video` (MCP returns base64; WebAPI returns binary MP4)
+- Added retention policy: keep latest 10 recordings by default (`recording.maxSavedFiles`, configurable; old files auto-pruned).
+- Added recording config in `params.json` support via `server/config.js`:
+  - `recording.maxDurationSec`, `recording.maxSavedFiles`, `recording.fps`, `recording.quality`, `recording.ffmpegPath`
+- Updated docs in `AI_USAGE.md` (tab + video API/MCP usage and constraints).
+- Remote deploy verified on `192.168.0.190` with phrase `jackie7`:
+  - `/api/version` -> `2026.02.22-004827-jackie7`
+  - Tested on `https://www.shadertoy.com/view/XstXR2` and completed `start -> list -> fetch` flow with real MP4 output.
+- Added video examples into `ToolsHelp` guide generator output (WebAPI + MCP JSON-RPC snippets).
+- Saved remote test recording locally for inspection:
+  - `ai-deck/tmp/test-recording-mlwkdz5s-8ad901d1.mp4`
+- Deployed UI update to remote with phrase `jackie8`:
+  - `/api/version` -> `2026.02.22-010621-jackie8`
+- MCP robustness fix: for `tools/call`, runtime tool failures now return JSON-RPC `result` with `isError: true` (instead of top-level JSON-RPC `error`), so AI frameworks treat it as tool-level failure and do not break/reconnect MCP transport.
+- Deployed fix to remote with phrase `jackie9`:
+  - `/api/version` -> `2026.02.22-045835-jackie9`
+- Input tool upgrade:
+  - renamed primary tool from `input` to `keyboard` (old `input` kept as backward-compatible alias)
+  - `keyboard` now supports key/shortcut/combo params (e.g. `pgup`, `pgdn`, `keys:["Control","a"]`)
+  - added `paste` tool for large text/html/image/files
+  - added `viewClipboard` tool for reading tool-level virtual clipboard content
+  - MCP schema parameter descriptions were updated for all new fields
+- Docs updated:
+  - `AI_USAGE.md` and `ToolsHelp.vue` now use `keyboard` and include `paste`/`viewClipboard` examples
+- Remote deploy verified with phrase `jackie10`:
+  - `/api/version` -> `2026.02.22-053808-jackie10`
+  - MCP validation on `test`: `tools/list` includes `keyboard/paste/viewClipboard`, `pgdn` shortcut works, `paste` + `viewClipboard` return expected results
+- MCP connection bugfix for Cursor transport fallback:
+  - Added JSON 404 fallbacks for unknown MCP/API routes so they no longer fall through to SPA `index.html` (`<!DOCTYPE...`).
+  - This prevents MCP clients from failing JSON parsing when trying streamable/SSE fallback paths.
+- Deployed fix with phrase `jackie11`:
+  - `/api/version` -> `2026.02.22-054339-jackie11`
+- Clipboard capture enhancement for JS-driven copy:
+  - Added page-level clipboard hook in MCP service:
+    - listens `copy` / `cut` / `paste` events
+    - wraps `navigator.clipboard.writeText` when possible
+    - stores into virtual clipboard so `viewClipboard` can read it
+  - Verified with in-page test button triggering JS copy of large text; `viewClipboard` now returns copied content (`textLength=6008`, source `clipboard_writeText`).
+- Deployed with phrase `jackie12`:
+  - `/api/version` -> `2026.02.22-060437-jackie12`
+  - evidence: `ai-deck/tmp/js-copy-testpage.jpg`
+- Clipboard reliability fix (Ctrl+C + UI JS copy):
+  - `copySelection` now captures selection from `input/textarea` (not only `window.getSelection()`).
+  - page hook now also intercepts `document.execCommand('copy'/'cut')`.
+  - `viewClipboard` attempts real clipboard read via `navigator.clipboard.readText()` after CDP permission grant when possible.
+- Verified on `tools-help/mcp` page:
+  - clicking “复制 token” updates `viewClipboard` (`source=clipboard_writeText`, JWT text length ~185).
+  - Ctrl+C on textarea selected text updates `viewClipboard` (`text=CTRL_C`, source `copy`).
+- Deployed with phrase `jackie13`:
+  - `/api/version` -> `2026.02.22-062917-jackie13`
+  - evidence: `ai-deck/tmp/toolshelp-copytoken-ok.jpg`
+- Clipboard sync unification follow-up:
+  - unified WS/MCP clipboard cache path by syncing clipboard updates into `browserManager` session clipboard + emitting `clipboard_updated` events
+  - clipboard hook now installed for WS page lifecycle too (not only MCP calls)
+  - use init-time injection (`evaluateOnNewDocument`, Playwright-style init script equivalent) for `copy/cut/paste`, `execCommand`, and clipboard API wrappers
+  - auto-grant clipboard permissions on page access; `viewClipboard` can optionally read real clipboard
+  - fixed precedence so recent Ctrl+C copy is not overwritten by stale JS clipboard cache
+- Deployed with phrase `jackie16`:
+  - `/api/version` -> `2026.02.22-065827-jackie16`
+  - verified sequence: JS copy token -> `viewClipboard` shows token; then Ctrl+A/C selection -> `viewClipboard` updates to selected text (`FULL_SELECTION_TEXT_123`)
+- Further clipboard regression fix (`jackie17`):
+  - `keyboard` Ctrl+C/Ctrl+X now executes real key combo first, then syncs copied/cut text into shared cache (instead of short-circuiting before key events).
+  - Added WS push bridge for clipboard cache updates (`clipboard_updated` -> `clipboard_content`) so client-side and API/MCP stay aligned.
+  - Verified on normal page text (no textarea setup): on `https://example.com`, Ctrl+A/C and JS `navigator.clipboard.writeText` both update `viewClipboard` correctly.
+- Deployed with phrase `jackie17`:
+  - `/api/version` -> `2026.02.22-135254-jackie17`
+  - evidence: `ai-deck/tmp/clipboard-plainpage-jackie17.jpg`
+- API vs MCP clipboard consistency fix (`jackie18`):
+  - Root cause: `/api/mcp/:browserId/clipboard/view` could read caller-session clipboard only, while Ctrl+C may come from another active user session.
+  - Added browser-level latest clipboard cache in `browserManager` and merged fallback in `mcpService` so API and MCP return the latest browser clipboard state.
+  - Verified with cross-user test:
+    - user2 performs Ctrl+A/C on `example.com`
+    - admin calls WebAPI `GET /api/mcp/test/clipboard/view`
+    - API and MCP both return same copied text (`Example Domain...`, len 128).
+- Deployed with phrase `jackie18`:
+  - `/api/version` -> `2026.02.22-140435-jackie18`
+

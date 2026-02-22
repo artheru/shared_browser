@@ -14,11 +14,25 @@ const TOOL_DEFINITIONS = [
     apiMethod: 'POST'
   },
   {
-    id: 'input',
-    name: 'Input',
-    description: 'Type text into focused element or selector',
-    mcpPath: 'input',
+    id: 'keyboard',
+    name: 'Keyboard',
+    description: 'Type text, send key press/combo shortcuts (e.g. pgup/pgdn), or press Enter',
+    mcpPath: 'keyboard',
     apiMethod: 'POST'
+  },
+  {
+    id: 'paste',
+    name: 'Paste',
+    description: 'Paste large text/html/image/files into current focused element',
+    mcpPath: 'paste',
+    apiMethod: 'POST'
+  },
+  {
+    id: 'viewClipboard',
+    name: 'View Clipboard',
+    description: 'Read virtual browser clipboard content captured by tools',
+    mcpPath: 'clipboard/view',
+    apiMethod: 'GET'
   },
   {
     id: 'tabs_list',
@@ -47,6 +61,27 @@ const TOOL_DEFINITIONS = [
     description: 'Close tab by index (last tab falls back to default URL)',
     mcpPath: 'tabs/close',
     apiMethod: 'POST'
+  },
+  {
+    id: 'start_video_recording',
+    name: 'Start Video Recording',
+    description: 'Record browser screen to MP4 for a fixed duration (max 15s cap)',
+    mcpPath: 'video/start',
+    apiMethod: 'POST'
+  },
+  {
+    id: 'list_recorded_videos',
+    name: 'List Recorded Videos',
+    description: 'List available recorded MP4 files (fileId, size, time)',
+    mcpPath: 'video/list',
+    apiMethod: 'GET'
+  },
+  {
+    id: 'fetch_video',
+    name: 'Fetch Video',
+    description: 'Fetch recorded MP4 by fileId',
+    mcpPath: 'video/:fileId',
+    apiMethod: 'GET'
   },
   {
     id: 'downloads',
@@ -100,9 +135,14 @@ function normalizeToolAccess(input) {
   const defaults = buildDefaultToolAccess();
   if (!input || typeof input !== 'object') return defaults;
 
+  const legacyInput = input.input && typeof input.input === 'object' ? input.input : null;
   const merged = {};
   for (const tool of TOOL_DEFINITIONS) {
-    const current = input[tool.id] || {};
+    let current = input[tool.id] || {};
+    // Backward compatibility: migrate old "input" access setting to new "keyboard" tool.
+    if (tool.id === 'keyboard' && (!current || typeof current !== 'object' || Object.keys(current).length === 0) && legacyInput) {
+      current = legacyInput;
+    }
     merged[tool.id] = {
       mcpEnabled: typeof current.mcpEnabled === 'boolean' ? current.mcpEnabled : defaults[tool.id].mcpEnabled,
       apiEnabled: typeof current.apiEnabled === 'boolean' ? current.apiEnabled : defaults[tool.id].apiEnabled

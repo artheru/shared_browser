@@ -240,10 +240,11 @@ ${authSection}
 ## AI Operation Manual
 1. Always call \`screenshot\` before action.
 2. Use \`dev/html\` or \`dev/eval\` to locate the target.
-3. Send exactly one \`pointer\` or \`input\` action.
+3. Send exactly one \`pointer\` or \`keyboard\` action.
 4. Wait 200ms-1500ms.
 5. Call \`screenshot\` again to verify.
 6. On failure, retry with updated selector/coordinates.
+7. For recordings, call \`start_video_recording\` and wait for returned \`fileId\` before any follow-up API.
 
 ## API Examples (Full URL)
 ### Screenshot
@@ -262,12 +263,20 @@ curl -s -X POST "${fullMcpBaseUrl.value}/pointer" \\
   -d '{"startSelector":"button[type=\\"submit\\"]","endSelector":"button[type=\\"submit\\"]","clickAtEnd":true,"button":"left"}'
 \`\`\`
 
-### Input text
+### Keyboard text input
 \`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/input" \\
+curl -s -X POST "${fullMcpBaseUrl.value}/keyboard" \\
   -H "Authorization: Bearer ${token}" \\
   -H "Content-Type: application/json" \\
   -d '{"selector":"input[name=\\"q\\"]","clearBefore":true,"text":"hello","pressEnter":true}'
+\`\`\`
+
+### Keyboard shortcut (PageDown)
+\`\`\`bash
+curl -s -X POST "${fullMcpBaseUrl.value}/keyboard" \\
+  -H "Authorization: Bearer ${token}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"shortcut":"pgdn"}'
 \`\`\`
 
 ### Eval page state
@@ -276,6 +285,50 @@ curl -s -X POST "${fullMcpBaseUrl.value}/dev/eval" \\
   -H "Authorization: Bearer ${token}" \\
   -H "Content-Type: application/json" \\
   -d '{"script":"({url: location.href, title: document.title})"}'
+\`\`\`
+
+## Video Recording APIs
+### Start recording (blocking, max 15s cap)
+\`\`\`bash
+curl -s -X POST "${fullMcpBaseUrl.value}/video/start" \\
+  -H "Authorization: Bearer ${token}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"durationSec":6}'
+\`\`\`
+
+### List recorded videos
+\`\`\`bash
+curl -s "${fullMcpBaseUrl.value}/video/list" \\
+  -H "Authorization: Bearer ${token}"
+\`\`\`
+
+### Fetch MP4 by fileId
+\`\`\`bash
+curl -L "${fullMcpBaseUrl.value}/video/<fileId>" \\
+  -H "Authorization: Bearer ${token}" \\
+  -o recording.mp4
+\`\`\`
+
+### MCP JSON-RPC examples
+\`\`\`json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_video_recording","arguments":{"durationSec":6}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_recorded_videos","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_video","arguments":{"fileId":"<fileId>"}}}
+\`\`\`
+
+## Clipboard APIs
+### Paste large content
+\`\`\`bash
+curl -s -X POST "${fullMcpBaseUrl.value}/paste" \\
+  -H "Authorization: Bearer ${token}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"text":"large text ..."}'
+\`\`\`
+
+### View browser clipboard
+\`\`\`bash
+curl -s "${fullMcpBaseUrl.value}/clipboard/view" \\
+  -H "Authorization: Bearer ${token}"
 \`\`\`
 
 ## Declared Tools

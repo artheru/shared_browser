@@ -22,7 +22,11 @@ All protected endpoints require:
 4. Use MCP/WebAPI tools to inspect and operate pages:
    - screenshot
    - pointer
-   - input
+  - keyboard
+  - paste
+  - viewClipboard
+   - tabs_list / tabs_select / tabs_new / tabs_close
+   - start_video_recording / list_recorded_videos / fetch_video
    - dev_html
    - dev_console
    - dev_eval
@@ -69,7 +73,16 @@ For browser `everything`, route pattern is:
 
 - `POST /api/mcp/everything/screenshot`
 - `POST /api/mcp/everything/pointer`
-- `POST /api/mcp/everything/input`
+- `POST /api/mcp/everything/keyboard`
+- `POST /api/mcp/everything/paste`
+- `GET  /api/mcp/everything/clipboard/view`
+- `GET  /api/mcp/everything/tabs`
+- `POST /api/mcp/everything/tabs/select`
+- `POST /api/mcp/everything/tabs/new`
+- `POST /api/mcp/everything/tabs/close`
+- `POST /api/mcp/everything/video/start`
+- `GET  /api/mcp/everything/video/list`
+- `GET  /api/mcp/everything/video/<fileId>`
 - `GET  /api/mcp/everything/dev/html`
 - `GET  /api/mcp/everything/dev/console`
 - `POST /api/mcp/everything/dev/eval`
@@ -114,7 +127,7 @@ Returns `imageBase64`, `url`, `title`, `dialogs`, `source`.
 }
 ```
 
-### 6.4 Input text
+### 6.4 Keyboard input / shortcuts
 
 ```json
 {
@@ -133,6 +146,14 @@ Press Enter at end:
 }
 ```
 
+Shortcut example (PageDown):
+
+```json
+{
+  "shortcut": "pgdn"
+}
+```
+
 ### 6.5 Evaluate JS
 
 ```json
@@ -141,13 +162,114 @@ Press Enter at end:
 }
 ```
 
+### 6.8 Paste and viewClipboard
+
+Paste large text:
+
+```json
+{
+  "text": "very long text..."
+}
+```
+
+Paste image/file (base64):
+
+```json
+{
+  "files": [
+    {
+      "name": "sample.png",
+      "mimeType": "image/png",
+      "contentBase64": "<base64>"
+    }
+  ]
+}
+```
+
+View browser clipboard:
+
+```bash
+curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/clipboard/view" \
+  -H "Authorization: Bearer <token>"
+```
+
+### 6.6 Tab operations
+
+List tabs:
+
+```bash
+curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/tabs" \
+  -H "Authorization: Bearer <token>"
+```
+
+Select tab:
+
+```json
+{
+  "tabIndex": 1
+}
+```
+
+New tab (optional URL):
+
+```json
+{
+  "url": "https://example.com"
+}
+```
+
+Close tab:
+
+```json
+{
+  "tabIndex": 1
+}
+```
+
+### 6.7 Video recording (AI)
+
+Start recording (blocking call; returns only after MP4 is ready):
+
+```json
+{
+  "durationSec": 8
+}
+```
+
+Rules:
+
+- `durationSec` is required.
+- Hard cap is 15 seconds.
+- Admin can lower cap via `params.json` -> `recording.maxDurationSec`.
+
+List available recordings:
+
+```bash
+curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/video/list" \
+  -H "Authorization: Bearer <token>"
+```
+
+Fetch MP4:
+
+```bash
+curl -L "http://192.168.0.190:3000/api/mcp/<browserId>/video/<fileId>" \
+  -H "Authorization: Bearer <token>" \
+  -o record.mp4
+```
+
+Retention:
+
+- Keeps latest `10` recordings by default.
+- Admin can tune via `params.json` -> `recording.maxSavedFiles`.
+- Older files are auto-pruned.
+
 ## 7. Reliable Action Loop (Important)
 
 Use this loop for every UI action:
 
 1. `screenshot` to capture current state.
 2. `dev/html` or `dev/eval` to locate target element/selector.
-3. Perform one action (`pointer` or `input`).
+3. Perform one action (`pointer` or `keyboard`).
 4. Wait briefly (200ms-1500ms).
 5. `screenshot` + `dev/eval` to confirm effect.
 6. If failed, retry with adjusted selector or coordinates.

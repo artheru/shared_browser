@@ -42,6 +42,7 @@ module.exports = {
   // 文件上传配置
   uploadsDir: path.join(__dirname, '..', 'uploads'),
   downloadsDir: path.join(__dirname, '..', 'downloads'),
+  recordingsDir: path.join(__dirname, '..', 'recordings'),
   maxFileSize: 100 * 1024 * 1024, // 100MB
 
   // 串流配置
@@ -122,6 +123,16 @@ module.exports = {
     enabled: params.mcp?.enabled !== false,
     routePrefix: params.mcp?.routePrefix || '/api/mcp',
     debugEnabled: !!params['mcp-debug']
+  },
+
+  // AI 视频录制配置
+  recording: {
+    // hard ceiling is always <= 15s even if configured larger
+    maxDurationSec: Number(params.recording?.maxDurationSec || 15),
+    maxSavedFiles: Number(params.recording?.maxSavedFiles || 10),
+    fps: Number(params.recording?.fps || 10),
+    quality: Number(params.recording?.quality || 80),
+    ffmpegPath: params.recording?.ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg'
   },
 
   // 日志轮转配置

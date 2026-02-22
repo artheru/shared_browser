@@ -12,6 +12,7 @@ class BrowserManager {
     this.browsers = new Map();        // browserId -> Browser instance
     this.userSessions = new Map();    // `${browserId}_${userId}` -> session object
     this.eventListeners = new Map();  // `${browserId}_${userId}` -> callback
+    this.browserClipboard = new Map(); // browserId -> latest clipboard payload (cross-session)
     this.cursorStates = new Map();    // browserId -> cursor state
     this.browserLastActive = new Map(); // browserId -> timestamp(ms)
     this.noOpenerSuppressionUntil = new Map(); // browserId -> timestamp(ms)
@@ -709,6 +710,7 @@ class BrowserManager {
     if (this.userSessions.has(key)) {
       const session = this.userSessions.get(key);
       if (session.users) session.users.add(String(userId));
+      await this._syncSessionActiveIndexByFocus(browserId, userId, session);
       // 验证至少有一个可用的 tab
       if (session.tabs.length > 0) {
         try {
@@ -749,6 +751,7 @@ class BrowserManager {
       tabs: [],
       activeIndex: 0,
       clipboard: '',  // 虚拟剪贴板（per-session，不污染系统剪贴板）
+      clipboardMeta: null,
       creatingTab: false,
       users: new Set([String(userId)])
     };
@@ -806,6 +809,55 @@ class BrowserManager {
       }
     }
 
+    return session;
+  }
+
+  async _syncSessionActiveIndexByFocus(browserId, userId, session) {
+    if (!session || !Array.isArray(session.tabs) || session.tabs.length <= 1) return;
+    const oldIndex = Math.min(
+      Math.max(0, Number(session.activeIndex || 0)),
+      session.tabs.length - 1
+    );
+    let focusedIndex = -1;
+
+    for (let i = 0; i < session.tabs.length; i++) {
+      const tab = session.tabs[i];
+      if (!tab || !tab.page) continue;
+      let timer = null;
+      try {
+        const focused = await Promise.race([
+          tab.page.evaluate(() => {
+            return document.hasFocus() || document.visibilityState === 'visible';
+          }),
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(false), 220);
+          })
+        ]);
+        if (focused) {
+          focusedIndex = i;
+          break;
+        }
+      } catch (_) {
+        // ignore per-tab focus probing failure
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    if (focusedIndex >= 0 && focusedIndex !== oldIndex) {
+      session.activeIndex = focusedIndex;
+      logger.info(browserId, 'Aligned active tab by focus probe', {
+        userId,
+        oldIndex,
+        newIndex: focusedIndex
+      });
+    }
+  }
+
+  async alignActiveTab(browserId, userId) {
+    const session = await this.getSessionForUser(browserId, userId);
+    if (!session) return null;
+    await this._syncSessionActiveIndexByFocus(browserId, userId, session);
     return session;
   }
 
@@ -1556,6 +1608,67 @@ class BrowserManager {
 
   // ============== 虚拟剪贴板 ==============
 
+  setClipboard(browserId, userId, text, options = {}) {
+    const key = this._getSessionKey(browserId, userId);
+    const session = this.userSessions.get(key);
+    if (!session) return null;
+    const nextText = String(text || '');
+    session.clipboard = nextText;
+    session.clipboardMeta = {
+      text: nextText,
+      html: String(options.html || ''),
+      files: Array.isArray(options.files) ? options.files : [],
+      source: String(options.source || 'unknown'),
+      updatedAt: new Date().toISOString()
+    };
+    this.browserClipboard.set(browserId, {
+      text: nextText,
+      html: session.clipboardMeta.html,
+      files: session.clipboardMeta.files,
+      source: session.clipboardMeta.source,
+      updatedAt: session.clipboardMeta.updatedAt,
+      userId: String(userId || '')
+    });
+    this._emitEvent(key, {
+      type: 'clipboard_updated',
+      clipboard: {
+        text: nextText,
+        html: session.clipboardMeta.html,
+        files: session.clipboardMeta.files,
+        source: session.clipboardMeta.source,
+        updatedAt: session.clipboardMeta.updatedAt
+      }
+    });
+    return session.clipboardMeta;
+  }
+
+  getClipboard(browserId, userId) {
+    const key = this._getSessionKey(browserId, userId);
+    const session = this.userSessions.get(key);
+    if (!session) return null;
+    const meta = session.clipboardMeta || {};
+    return {
+      text: String(session.clipboard || ''),
+      html: String(meta.html || ''),
+      files: Array.isArray(meta.files) ? meta.files : [],
+      source: String(meta.source || (session.clipboard ? 'session' : 'empty')),
+      updatedAt: meta.updatedAt || null
+    };
+  }
+
+  getBrowserClipboard(browserId) {
+    const clip = this.browserClipboard.get(browserId);
+    if (!clip) return null;
+    return {
+      text: String(clip.text || ''),
+      html: String(clip.html || ''),
+      files: Array.isArray(clip.files) ? clip.files : [],
+      source: String(clip.source || 'browser'),
+      updatedAt: clip.updatedAt || null,
+      userId: String(clip.userId || '')
+    };
+  }
+
   async copySelection(browserId, userId) {
     const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);
@@ -1563,8 +1676,23 @@ class BrowserManager {
 
     const page = session.tabs[session.activeIndex].page;
     try {
-      const text = await page.evaluate(() => window.getSelection().toString());
-      session.clipboard = text;
+      const text = await page.evaluate(() => {
+        const active = document.activeElement;
+        // input/textarea selection is not reflected by window.getSelection()
+        if (active && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'submit', 'file'].includes((active.type || '').toLowerCase())))) {
+          const v = String(active.value || '');
+          const start = Number.isFinite(active.selectionStart) ? active.selectionStart : 0;
+          const end = Number.isFinite(active.selectionEnd) ? active.selectionEnd : start;
+          if (end > start) return v.slice(start, end);
+        }
+        if (active && active.isContentEditable) {
+          const sel = window.getSelection();
+          return sel ? String(sel.toString() || '') : '';
+        }
+        const sel = window.getSelection();
+        return sel ? String(sel.toString() || '') : '';
+      });
+      this.setClipboard(browserId, userId, text, { source: 'copy' });
       return text;
     } catch (e) {
       logger.error(browserId, `Copy failed: ${e.message}`);
@@ -1578,9 +1706,7 @@ class BrowserManager {
     if (!session || session.tabs.length === 0) return;
 
     // 更新虚拟剪贴板
-    if (text) {
-      session.clipboard = text;
-    }
+    if (text) this.setClipboard(browserId, userId, text, { source: 'paste' });
 
     const textToPaste = text || session.clipboard;
     if (!textToPaste) return;
@@ -1604,6 +1730,7 @@ class BrowserManager {
   async cutSelection(browserId, userId) {
     const text = await this.copySelection(browserId, userId);
     if (text) {
+      this.setClipboard(browserId, userId, text, { source: 'cut' });
       const page = this.getActivePage(browserId, userId);
       if (page) {
         try {
@@ -2031,6 +2158,7 @@ class BrowserManager {
   _cleanupBrowserRuntimeData(browserId) {
     this.browserLastActive.delete(browserId);
     this.cursorStates.delete(browserId);
+    this.browserClipboard.delete(browserId);
     this.noOpenerSuppressionUntil.delete(browserId);
     streamService.stopSessionsForBrowser(browserId);
 

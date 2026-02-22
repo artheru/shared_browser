@@ -9,6 +9,77 @@ class McpService {
   constructor() {
     this.consoleBuffer = new Map(); // browserId -> [{timestamp,type,text}]
     this.maxConsoleEntries = 500;
+    this.clipboardStore = new Map(); // `${browserId}_${userId}` -> { text, html, files, updatedAt, source }
+  }
+
+  _clipboardKey(browserId, userId = 'api') {
+    return `${browserId}_${userId || 'api'}`;
+  }
+
+  _getSessionClipboard(browserId, userId = 'api') {
+    const clip = browserManager.getClipboard(browserId, userId);
+    return clip?.text || '';
+  }
+
+  _setClipboard(browserId, userId, payload = {}) {
+    const key = this._clipboardKey(browserId, userId);
+    const current = this.clipboardStore.get(key) || {};
+    const next = {
+      text: payload.text !== undefined ? String(payload.text || '') : (current.text || ''),
+      html: payload.html !== undefined ? String(payload.html || '') : (current.html || ''),
+      files: Array.isArray(payload.files) ? payload.files : (current.files || []),
+      updatedAt: new Date().toISOString(),
+      source: payload.source || current.source || 'tool'
+    };
+    this.clipboardStore.set(key, next);
+    // Keep BrowserManager clipboard cache in sync (WS + MCP share one source of truth).
+    try {
+      browserManager.setClipboard(browserId, userId, next.text, {
+        html: next.html,
+        files: next.files,
+        source: next.source
+      });
+    } catch (_) {}
+    return next;
+  }
+
+  _getClipboard(browserId, userId = 'api') {
+    const key = this._clipboardKey(browserId, userId);
+    const cached = this.clipboardStore.get(key) || null;
+    const sessionClip = browserManager.getClipboard(browserId, userId);
+    const browserClip = browserManager.getBrowserClipboard(browserId);
+    if (cached || sessionClip || browserClip) {
+      const candidates = [];
+      if (cached) {
+        candidates.push({
+          text: String(cached.text || ''),
+          html: String(cached.html || ''),
+          files: Array.isArray(cached.files) ? cached.files : [],
+          source: String(cached.source || 'cache'),
+          updatedAt: cached.updatedAt || null
+        });
+      }
+      if (sessionClip) candidates.push(sessionClip);
+      if (browserClip) candidates.push(browserClip);
+      const pickTs = (x) => Date.parse(String(x?.updatedAt || '')) || 0;
+      candidates.sort((a, b) => pickTs(b) - pickTs(a));
+      const top = candidates[0] || {};
+      return {
+        text: String(top.text || ''),
+        html: String(top.html || ''),
+        files: Array.isArray(top.files) ? top.files : [],
+        updatedAt: top.updatedAt || null,
+        source: String(top.source || 'unknown')
+      };
+    }
+    const sessionText = this._getSessionClipboard(browserId, userId);
+    return {
+      text: sessionText || '',
+      html: '',
+      files: [],
+      updatedAt: null,
+      source: sessionText ? 'session' : 'empty'
+    };
   }
 
   async getPage(browserId, userId = 'api') {
@@ -31,7 +102,163 @@ class McpService {
       await fileService.setupDownloadHandling(page, browserId, downloadOwner);
       page.__mcpDownloadReadyFor = downloadOwner;
     }
+    await this.ensureClipboardHook(browserId, userId, page);
     return page;
+  }
+
+  async ensureClipboardHook(browserId, userId, page) {
+    try {
+      const pageUrl = String(page.url() || '');
+      const origin = pageUrl.startsWith('http') ? new URL(pageUrl).origin : '';
+      if (origin) {
+        await page.browserContext().overridePermissions(origin, ['clipboard-read', 'clipboard-write']).catch(() => {});
+        const cdpGrant = await page.target().createCDPSession();
+        try {
+          await cdpGrant.send('Browser.grantPermissions', {
+            origin,
+            permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite']
+          });
+        } catch (_) {}
+        try { await cdpGrant.detach(); } catch (_) {}
+      }
+    } catch (_) {}
+
+    if (!page.__sbClipboardNotifyExposed) {
+      page.__sbClipboardNotifyExposed = true;
+      await page.exposeFunction('__sbClipboardNotify', async (payload = {}) => {
+        const ownerUserId = String(payload.userId || userId || 'api');
+        this._setClipboard(browserId, ownerUserId, {
+          text: payload.text || '',
+          html: payload.html || '',
+          files: Array.isArray(payload.files) ? payload.files : [],
+          source: payload.source || 'page_hook'
+        });
+      }).catch(() => {});
+    }
+
+    const installScript = () => {
+      const notify = (payload = {}) => {
+        try {
+          const fn = window.__sbClipboardNotify;
+          if (typeof fn === 'function') {
+            fn({
+              userId: window.__sbClipboardUserId || 'api',
+              ...payload
+            });
+          }
+        } catch (_) {}
+      };
+      const update = (payload = {}) => {
+        const prev = window.__sbVirtualClipboard || {};
+        const next = {
+          text: payload.text !== undefined ? String(payload.text || '') : String(prev.text || ''),
+          html: payload.html !== undefined ? String(payload.html || '') : String(prev.html || ''),
+          files: Array.isArray(payload.files) ? payload.files : (Array.isArray(prev.files) ? prev.files : []),
+          updatedAt: new Date().toISOString(),
+          source: payload.source || prev.source || 'hook'
+        };
+        window.__sbVirtualClipboard = next;
+        notify(next);
+      };
+
+      if (!window.__sbVirtualClipboard) {
+        update({ text: '', html: '', files: [], source: 'init' });
+      }
+
+      if (window.__sbClipboardHookInstalled) {
+        window.__sbClipboardUserId = window.__sbClipboardUserId || 'api';
+        return true;
+      }
+      window.__sbClipboardHookInstalled = true;
+      window.__sbClipboardUserId = window.__sbClipboardUserId || 'api';
+
+      const captureActiveSelection = () => {
+        const active = document.activeElement;
+        if (active && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'submit', 'file'].includes((active.type || '').toLowerCase())))) {
+          const v = String(active.value || '');
+          const start = Number.isFinite(active.selectionStart) ? active.selectionStart : 0;
+          const end = Number.isFinite(active.selectionEnd) ? active.selectionEnd : start;
+          if (end > start) return v.slice(start, end);
+        }
+        const sel = window.getSelection?.();
+        return String(sel?.toString?.() || '');
+      };
+
+      window.addEventListener('copy', (e) => {
+        try {
+          const cd = e.clipboardData;
+          const text = (cd && cd.getData('text/plain')) || captureActiveSelection();
+          const html = (cd && cd.getData('text/html')) || '';
+          update({ text, html, source: 'event_copy' });
+        } catch (_) {}
+      }, true);
+
+      window.addEventListener('cut', (e) => {
+        try {
+          const cd = e.clipboardData;
+          const text = (cd && cd.getData('text/plain')) || captureActiveSelection();
+          const html = (cd && cd.getData('text/html')) || '';
+          update({ text, html, source: 'event_cut' });
+        } catch (_) {}
+      }, true);
+
+      window.addEventListener('paste', (e) => {
+        try {
+          const cd = e.clipboardData;
+          const text = (cd && cd.getData('text/plain')) || '';
+          const html = (cd && cd.getData('text/html')) || '';
+          const files = [];
+          if (cd && cd.files && cd.files.length > 0) {
+            for (const f of cd.files) {
+              files.push({ name: f.name || '', mimeType: f.type || '' });
+            }
+          }
+          update({ text, html, files, source: 'event_paste' });
+        } catch (_) {}
+      }, true);
+
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function' && !navigator.clipboard.__sbWrappedWriteText) {
+          const origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+          const wrapped = async (text) => {
+            update({ text: String(text || ''), source: 'clipboard_writeText' });
+            return origWriteText(text);
+          };
+          wrapped.__sbWrappedWriteText = true;
+          navigator.clipboard.writeText = wrapped;
+        }
+      } catch (_) {}
+
+      try {
+        if (!document.__sbWrappedExecCommand) {
+          document.__sbWrappedExecCommand = true;
+          const originalExecCommand = document.execCommand ? document.execCommand.bind(document) : null;
+          if (originalExecCommand) {
+            document.execCommand = function(cmd, ui, value) {
+              const lower = String(cmd || '').toLowerCase();
+              if (lower === 'copy' || lower === 'cut') {
+                const text = captureActiveSelection();
+                update({ text, source: lower === 'copy' ? 'execCommand_copy' : 'execCommand_cut' });
+              }
+              return originalExecCommand(cmd, ui, value);
+            };
+          }
+        }
+      } catch (_) {}
+
+      return true;
+    };
+
+    try {
+      if (!page.__mcpClipboardHookInit) {
+        page.__mcpClipboardHookInit = true;
+        await page.evaluateOnNewDocument(`(${installScript.toString()})();`).catch(() => {});
+      }
+      await page.evaluate((uid) => {
+        window.__sbClipboardUserId = String(uid || 'api');
+      }, String(userId || 'api')).catch(() => {});
+      await page.evaluate(`(${installScript.toString()})();`).catch(() => {});
+    } catch (_) {}
   }
 
   ensureConsoleHook(browserId, page) {
@@ -149,9 +376,42 @@ class McpService {
     return { ok: true, start, end };
   }
 
-  async inputText(browserId, payload = {}, userId = 'api') {
+  _normalizeKey(keyRaw) {
+    const raw = String(keyRaw || '').trim();
+    if (!raw) return '';
+    const lowered = raw.toLowerCase();
+    const aliases = {
+      pgup: 'PageUp',
+      pageup: 'PageUp',
+      pgdn: 'PageDown',
+      pagedown: 'PageDown',
+      esc: 'Escape',
+      del: 'Delete',
+      ins: 'Insert',
+      enter: 'Enter',
+      tab: 'Tab',
+      space: 'Space',
+      left: 'ArrowLeft',
+      right: 'ArrowRight',
+      up: 'ArrowUp',
+      down: 'ArrowDown',
+      home: 'Home',
+      end: 'End',
+      ctrl: 'Control',
+      control: 'Control',
+      alt: 'Alt',
+      shift: 'Shift',
+      win: 'Meta',
+      cmd: 'Meta',
+      meta: 'Meta'
+    };
+    return aliases[lowered] || raw;
+  }
+
+  async keyboardInput(browserId, payload = {}, userId = 'api') {
     const page = await this.getPage(browserId, userId);
-    const text = String(payload.text || '');
+    const keyboard = page.keyboard;
+    const text = payload.text !== undefined ? String(payload.text) : '';
     if (payload.selector) {
       await page.focus(payload.selector);
     }
@@ -164,11 +424,241 @@ class McpService {
         }
       });
     }
-    await page.keyboard.type(text, { delay: payload.delayMs || 0 });
-    if (payload.pressEnter) {
-      await page.keyboard.press('Enter');
+    const comboKeys = Array.isArray(payload.keys) && payload.keys.length ? payload.keys : (Array.isArray(payload.combo) ? payload.combo : []);
+    const normalizedCombo = comboKeys.map((k) => this._normalizeKey(k)).filter(Boolean);
+    const singleKey = this._normalizeKey(payload.key || payload.shortcut || '');
+    const shortcuts = Array.isArray(payload.shortcuts) ? payload.shortcuts.map((k) => this._normalizeKey(k)).filter(Boolean) : [];
+
+    const comboSignature = normalizedCombo.map((k) => String(k).toLowerCase()).sort().join('+');
+
+    if (normalizedCombo.length > 0) {
+      for (const k of normalizedCombo) {
+        await keyboard.down(k);
+      }
+      for (const k of [...normalizedCombo].reverse()) {
+        await keyboard.up(k);
+      }
+    } else if (singleKey) {
+      const repeat = Math.max(1, Number(payload.repeat || 1));
+      for (let i = 0; i < repeat; i++) {
+        await keyboard.press(singleKey);
+      }
     }
-    return { ok: true };
+
+    for (const k of shortcuts) {
+      await keyboard.press(k);
+    }
+
+    if (text) {
+      await keyboard.type(text, { delay: payload.delayMs || 0 });
+    }
+    if (payload.pressEnter) {
+      await keyboard.press('Enter');
+    }
+
+    // Post-action sync for common clipboard combos.
+    if (comboSignature === 'c+control') {
+      const copied = await browserManager.copySelection(browserId, userId);
+      this._setClipboard(browserId, userId, { text: copied || '', source: 'copy' });
+      return { ok: true, action: 'copy', textLength: (copied || '').length };
+    }
+    if (comboSignature === 'control+x') {
+      const cutText = await browserManager.copySelection(browserId, userId);
+      this._setClipboard(browserId, userId, { text: cutText || '', source: 'cut' });
+      return { ok: true, action: 'cut', textLength: (cutText || '').length };
+    }
+    if (comboSignature === 'control+v') {
+      const clip = this._getClipboard(browserId, userId);
+      return { ok: true, action: 'paste', pastedTextLength: String(clip.text || '').length };
+    }
+
+    return {
+      ok: true,
+      typedLength: text.length,
+      key: singleKey || null,
+      combo: normalizedCombo
+    };
+  }
+
+  async inputText(browserId, payload = {}, userId = 'api') {
+    // Backward compatibility for older "input" tool id.
+    return this.keyboardInput(browserId, payload, userId);
+  }
+
+  async paste(browserId, payload = {}, userId = 'api') {
+    const page = await this.getPage(browserId, userId);
+    if (payload.selector) {
+      await page.focus(payload.selector);
+    }
+    const text = payload.text !== undefined ? String(payload.text || '') : '';
+    const html = payload.html !== undefined ? String(payload.html || '') : '';
+    const imageBase64 = payload.imageBase64 ? String(payload.imageBase64) : '';
+    const imageMimeType = String(payload.imageMimeType || 'image/png');
+    const extraFiles = Array.isArray(payload.files) ? payload.files : [];
+
+    if (!html && !imageBase64 && extraFiles.length === 0) {
+      if (text) {
+        await browserManager.pasteText(browserId, userId, text);
+        const clip = this._setClipboard(browserId, userId, { text, source: 'paste_text' });
+        return { ok: true, mode: 'insertText', pastedTextLength: text.length, clipboard: clip };
+      }
+      const clip = this._getClipboard(browserId, userId);
+      await browserManager.pasteText(browserId, userId, String(clip.text || ''));
+      return { ok: true, mode: 'insertText', pastedTextLength: String(clip.text || '').length, clipboard: clip };
+    }
+
+    const files = [];
+    if (imageBase64) {
+      files.push({
+        name: String(payload.imageName || `pasted-${Date.now()}.png`),
+        mimeType: imageMimeType,
+        contentBase64: imageBase64
+      });
+    }
+    for (const file of extraFiles) {
+      if (!file || !file.contentBase64) continue;
+      files.push({
+        name: String(file.name || `file-${Date.now()}`),
+        mimeType: String(file.mimeType || 'application/octet-stream'),
+        contentBase64: String(file.contentBase64)
+      });
+    }
+
+    const evalResult = await page.evaluate(({ pasteText, pasteHtml, pasteFiles }) => {
+      const toBytes = (b64) => {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const dt = new DataTransfer();
+      if (pasteText) dt.setData('text/plain', pasteText);
+      if (pasteHtml) dt.setData('text/html', pasteHtml);
+      for (const f of pasteFiles || []) {
+        const file = new File([toBytes(f.contentBase64)], f.name, { type: f.mimeType || 'application/octet-stream' });
+        dt.items.add(file);
+      }
+      const target = document.activeElement || document.body;
+      const evt = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(evt, 'clipboardData', { value: dt });
+      const dispatched = target.dispatchEvent(evt);
+
+      if (target instanceof HTMLInputElement && target.type === 'file' && dt.files && dt.files.length > 0) {
+        target.files = dt.files;
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      if ((!dispatched || target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target.type !== 'file')) && pasteText) {
+        if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+          const start = target.selectionStart ?? target.value.length;
+          const end = target.selectionEnd ?? target.value.length;
+          target.setRangeText(pasteText, start, end, 'end');
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+
+      return {
+        ok: true,
+        dispatched,
+        fileCount: dt.files ? dt.files.length : 0
+      };
+    }, {
+      pasteText: text,
+      pasteHtml: html,
+      pasteFiles: files
+    });
+
+    this._setClipboard(browserId, userId, {
+      text,
+      html,
+      files: files.map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      source: 'paste_event'
+    });
+    return {
+      ok: true,
+      mode: 'pasteEvent',
+      textLength: text.length,
+      htmlLength: html.length,
+      files: files.map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      ...evalResult
+    };
+  }
+
+  async viewClipboard(browserId, payload = {}, userId = 'api') {
+    const preferSystemClipboard = !!payload.preferSystemClipboard;
+    const cachedBefore = this._getClipboard(browserId, userId);
+    let pageCache = null;
+    try {
+      const page = await this.getPage(browserId, userId);
+      pageCache = await page.evaluate(() => window.__sbVirtualClipboard || null).catch(() => null);
+
+      // Try to read real page clipboard when browser/page permits it.
+      try {
+        const pageUrl = String(page.url() || '');
+        const origin = pageUrl.startsWith('http') ? new URL(pageUrl).origin : '';
+        if (origin) {
+          const cdp = await page.target().createCDPSession();
+          try {
+            await cdp.send('Browser.grantPermissions', {
+              origin,
+              permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite']
+            });
+          } catch (_) {}
+          try {
+            const realText = await page.evaluate(async () => {
+              try {
+                if (navigator.clipboard && navigator.clipboard.readText) {
+                  return await navigator.clipboard.readText();
+                }
+              } catch (_) {}
+              return '';
+            });
+            const shouldUseSystemClipboard = preferSystemClipboard || !String(cachedBefore?.text || '');
+            if (realText && shouldUseSystemClipboard) {
+              this._setClipboard(browserId, userId, { text: realText, source: 'navigator_clipboard_readText' });
+            }
+          } finally {
+            try { await cdp.detach(); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    } catch (_) {}
+
+    if (payload.captureSelection) {
+      const copied = await browserManager.copySelection(browserId, userId);
+      this._setClipboard(browserId, userId, { text: copied || '', source: 'captureSelection' });
+    }
+
+    const preferPageClipboard = !!payload.preferPageClipboard;
+    const cachedBeforeTs = Date.parse(String(cachedBefore?.updatedAt || '')) || 0;
+    const pageCacheTs = Date.parse(String(pageCache?.updatedAt || '')) || 0;
+    const hasPageClipboard = !!(pageCache && (pageCache.text || pageCache.html || (Array.isArray(pageCache.files) && pageCache.files.length > 0)));
+    const shouldUsePageClipboard = hasPageClipboard && (
+      preferPageClipboard ||
+      !String(cachedBefore?.text || '') ||
+      (pageCacheTs > 0 && pageCacheTs >= cachedBeforeTs)
+    );
+    if (shouldUsePageClipboard) {
+      this._setClipboard(browserId, userId, {
+        text: pageCache.text || '',
+        html: pageCache.html || '',
+        files: Array.isArray(pageCache.files) ? pageCache.files : [],
+        source: pageCache.source || 'page_hook'
+      });
+    }
+
+    const clip = this._getClipboard(browserId, userId);
+    return {
+      ok: true,
+      text: String(clip.text || ''),
+      html: String(clip.html || ''),
+      files: Array.isArray(clip.files) ? clip.files : [],
+      textLength: String(clip.text || '').length,
+      hasHtml: !!clip.html,
+      hasFiles: Array.isArray(clip.files) && clip.files.length > 0,
+      updatedAt: clip.updatedAt || null,
+      source: clip.source || 'unknown'
+    };
   }
 
   async listDownloads(browserId) {

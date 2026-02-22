@@ -30,6 +30,7 @@ const NetworkMonitor = require('./network-monitor');
 const usageTracker = require('./usage-tracker');
 const logger = require('./logger');
 const mcpService = require('./mcp-service');
+const videoRecordingService = require('./video-recording-service');
 const mcpLogger = require('./mcp-logger');
 const { TOOL_DEFINITIONS, normalizeToolAccess } = require('./browser-tools-registry');
 const { isUrlAllowedForUser } = require('./domain-policy');
@@ -635,9 +636,49 @@ function summarizeToolResponse(tool, data) {
       return {
         count: Array.isArray(data.entries) ? data.entries.length : 0
       };
+    case 'start_video_recording':
+      return {
+        fileId: data.fileId,
+        filename: data.filename,
+        durationSec: data.durationSec,
+        size: data.size
+      };
+    case 'list_recorded_videos':
+      return {
+        count: Array.isArray(data) ? data.length : 0
+      };
+    case 'fetch_video':
+      return {
+        fileId: data.fileId,
+        filename: data.filename,
+        size: data.size,
+        mimeType: data.mimeType,
+        hasContentBase64: !!data.contentBase64,
+        contentBase64Length: data.contentBase64 ? data.contentBase64.length : 0
+      };
+    case 'viewClipboard':
+      return {
+        textLength: Number(data.textLength || 0),
+        hasHtml: !!data.hasHtml,
+        hasFiles: !!data.hasFiles,
+        source: data.source || ''
+      };
+    case 'paste':
+      return {
+        mode: data.mode || '',
+        textLength: Number(data.textLength || data.pastedTextLength || 0),
+        fileCount: Array.isArray(data.files) ? data.files.length : Number(data.fileCount || 0)
+      };
     default:
       return data;
   }
+}
+
+function canonicalToolId(toolIdRaw) {
+  const name = String(toolIdRaw || '');
+  if (name === 'input') return 'keyboard';
+  if (name === 'view_clipboard') return 'viewClipboard';
+  return name;
 }
 
 function logToolCallStart(req, browserId, tool) {
@@ -708,6 +749,24 @@ function makeToolResultContent(data) {
   };
 }
 
+function makeToolErrorResult(err, toolName) {
+  const message = err?.message || String(err);
+  const payload = {
+    error: message,
+    tool: toolName || ''
+  };
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(payload)
+      }
+    ],
+    structuredContent: payload
+  };
+}
+
 function getMcpToolSchemas() {
   return {
     screenshot: {
@@ -736,8 +795,59 @@ function getMcpToolSchemas() {
       },
       additionalProperties: true
     },
+    keyboard: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to type.' },
+        selector: { type: 'string', description: 'Optional CSS selector to focus before keyboard actions.' },
+        clearBefore: { type: 'boolean', description: 'Clear target value/content before typing text.' },
+        delayMs: { type: 'number', description: 'Delay between keystrokes in milliseconds.' },
+        key: { type: 'string', description: 'Single key to press, supports aliases like pgup/pgdn.' },
+        shortcut: { type: 'string', description: 'Alias of key. Example: pgup, pgdn, esc.' },
+        shortcuts: { type: 'array', description: 'Sequence of keys to press in order.', items: { type: 'string' } },
+        keys: { type: 'array', description: 'Press key combo together. Example: ["Control","a"].', items: { type: 'string' } },
+        combo: { type: 'array', description: 'Alias of keys for combo press.', items: { type: 'string' } },
+        repeat: { type: 'number', description: 'Repeat count for single key press.' },
+        pressEnter: { type: 'boolean', description: 'Press Enter after typing.' }
+      },
+      additionalProperties: true
+    },
+    paste: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'Optional selector to focus before paste.' },
+        text: { type: 'string', description: 'Plain text to paste.' },
+        html: { type: 'string', description: 'Optional HTML clipboard content.' },
+        imageBase64: { type: 'string', description: 'Optional image content in base64 (without data URL prefix).' },
+        imageMimeType: { type: 'string', description: 'Image MIME type, for example image/png.' },
+        imageName: { type: 'string', description: 'Filename used for pasted image.' },
+        files: {
+          type: 'array',
+          description: 'Optional files to include in paste clipboard.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Filename shown to target page.' },
+              mimeType: { type: 'string', description: 'File MIME type.' },
+              contentBase64: { type: 'string', description: 'File binary in base64.' }
+            },
+            required: ['contentBase64'],
+            additionalProperties: true
+          }
+        }
+      },
+      additionalProperties: true
+    },
+    viewClipboard: {
+      type: 'object',
+      properties: {
+        captureSelection: { type: 'boolean', description: 'Capture current selected text into clipboard before reading.' }
+      },
+      additionalProperties: true
+    },
     input: {
       type: 'object',
+      description: 'Deprecated alias of keyboard.',
       properties: {
         text: { type: 'string', description: 'Text to type.' },
         selector: { type: 'string', description: 'Optional CSS selector to focus before typing.' },
@@ -773,6 +883,27 @@ function getMcpToolSchemas() {
         tabIndex: { type: 'number', description: 'Tab index to close.' }
       },
       required: ['tabIndex'],
+      additionalProperties: true
+    },
+    start_video_recording: {
+      type: 'object',
+      properties: {
+        durationSec: { type: 'number', description: 'Recording duration in seconds. Required. Max 15s (and admin-config limit).' }
+      },
+      required: ['durationSec'],
+      additionalProperties: true
+    },
+    list_recorded_videos: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    fetch_video: {
+      type: 'object',
+      properties: {
+        fileId: { type: 'string', description: 'File ID returned by start_video_recording/list_recorded_videos.' }
+      },
+      required: ['fileId'],
       additionalProperties: true
     },
     downloads: {
@@ -824,14 +955,20 @@ function buildMcpToolsForBrowser(browser) {
 }
 
 async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
-  switch (toolName) {
+  const canonicalTool = canonicalToolId(toolName);
+  switch (canonicalTool) {
     case 'screenshot':
       return await mcpService.screenshot(browserId, args || {}, userId);
     case 'pointer':
       return await mcpService.pointerAction(browserId, args || {}, userId);
-    case 'input':
-      return await mcpService.inputText(browserId, args || {}, userId);
+    case 'keyboard':
+      return await mcpService.keyboardInput(browserId, args || {}, userId);
+    case 'paste':
+      return await mcpService.paste(browserId, args || {}, userId);
+    case 'viewClipboard':
+      return await mcpService.viewClipboard(browserId, args || {}, userId);
     case 'tabs_list':
+      await browserManager.alignActiveTab(browserId, userId);
       return browserManager.getTabList(browserId, userId);
     case 'tabs_select': {
       const tabIndex = Number(args?.tabIndex);
@@ -850,6 +987,15 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       if (!Number.isFinite(tabIndex)) throw new Error('tabIndex is required');
       await browserManager.closeTab(browserId, userId, tabIndex);
       return browserManager.getTabList(browserId, userId);
+    }
+    case 'start_video_recording':
+      return await videoRecordingService.startRecording(browserId, userId, args || {});
+    case 'list_recorded_videos':
+      return videoRecordingService.listRecordedVideos(browserId);
+    case 'fetch_video': {
+      const fileId = String(args?.fileId || '');
+      if (!fileId) throw new Error('fileId is required');
+      return videoRecordingService.getVideoBase64(browserId, fileId);
     }
     case 'downloads':
       return await mcpService.listDownloads(browserId);
@@ -949,8 +1095,9 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
     }
 
     if (method === 'tools/call') {
-      const toolName = String(params.name || '');
-      if (!toolName) {
+      const toolNameRaw = String(params.name || '');
+      const toolName = canonicalToolId(toolNameRaw);
+      if (!toolNameRaw) {
         return res.status(400).json(makeJsonRpcError(id, -32602, 'Invalid params: name is required'));
       }
       if (!ensureMcpToolEnabled(res, browser, toolName)) return;
@@ -961,7 +1108,7 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
           method: 'POST',
           path: req.originalUrl,
           browserId,
-          tool: toolName,
+          tool: toolNameRaw,
           user: req.user?.username,
           request: {
             params: req.params,
@@ -971,12 +1118,14 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
         }
       };
       try {
-        const data = await executeMcpToolCall(browserId, req.user.id, toolName, params.arguments || {});
+        const data = await executeMcpToolCall(browserId, req.user.id, toolNameRaw, params.arguments || {});
         logToolCallOk(callCtx, data);
         return res.json(makeJsonRpcResult(id, makeToolResultContent(data)));
       } catch (e) {
         logToolCallError(callCtx, e);
-        return res.status(400).json(makeJsonRpcError(id, -32000, e.message || String(e)));
+        // Tool runtime errors should be returned as tool result (isError),
+        // so MCP clients do not treat them as transport/protocol failures.
+        return res.json(makeJsonRpcResult(id, makeToolErrorResult(e, toolName)));
       }
     }
 
@@ -1032,6 +1181,26 @@ app.post(`${config.mcp.routePrefix}/:browserId/pointer`, authMiddleware, async (
   }
 });
 
+app.post(`${config.mcp.routePrefix}/:browserId/keyboard`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'keyboard');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'keyboard')) return;
+
+    const data = await mcpService.keyboardInput(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Backward compatibility for older clients using /input
 app.post(`${config.mcp.routePrefix}/:browserId/input`, authMiddleware, async (req, res) => {
   const browserId = req.params.browserId;
   const callCtx = logToolCallStart(req, browserId, 'input');
@@ -1040,9 +1209,48 @@ app.post(`${config.mcp.routePrefix}/:browserId/input`, authMiddleware, async (re
     const browser = browserApi.getById(browserId);
     if (!browser) return res.status(404).json({ error: 'Browser not found' });
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
-    if (!ensureToolEnabled(res, browser, 'input')) return;
+    if (!ensureToolEnabled(res, browser, 'keyboard')) return;
 
-    const data = await mcpService.inputText(browserId, req.body || {}, req.user.id);
+    const data = await mcpService.keyboardInput(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/paste`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'paste');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'paste')) return;
+
+    const data = await mcpService.paste(browserId, req.body || {}, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/clipboard/view`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'viewClipboard');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'viewClipboard')) return;
+
+    const captureSelection = String(req.query.captureSelection || '').toLowerCase() === 'true';
+    const data = await mcpService.viewClipboard(browserId, { captureSelection }, req.user.id);
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1061,6 +1269,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/tabs`, authMiddleware, async (req,
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'tabs_list')) return;
 
+    await browserManager.alignActiveTab(browserId, req.user.id);
     const data = browserManager.getTabList(browserId, req.user.id);
     logToolCallOk(callCtx, data);
     res.json(data);
@@ -1127,6 +1336,67 @@ app.post(`${config.mcp.routePrefix}/:browserId/tabs/close`, authMiddleware, asyn
     const data = await executeMcpToolCall(browserId, req.user.id, 'tabs_close', { tabIndex });
     logToolCallOk(callCtx, data);
     res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/video/start`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'start_video_recording');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'start_video_recording')) return;
+
+    const data = await videoRecordingService.startRecording(browserId, req.user.id, req.body || {});
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/video/list`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'list_recorded_videos');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'list_recorded_videos')) return;
+
+    const data = videoRecordingService.listRecordedVideos(browserId);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/video/:fileId`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const fileId = String(req.params.fileId || '');
+  const callCtx = logToolCallStart(req, browserId, 'fetch_video');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'fetch_video')) return;
+
+    const info = videoRecordingService.getVideoFileInfo(browserId, fileId);
+    logToolCallOk(callCtx, info);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(info.size));
+    res.setHeader('Content-Disposition', `attachment; filename="${info.filename}"`);
+    fs.createReadStream(info.path).pipe(res);
   } catch (e) {
     logToolCallError(callCtx, e);
     res.status(400).json({ error: e.message });
@@ -1651,12 +1921,21 @@ wss.on('connection', async (ws, req) => {
             // 设置 Tab 事件监听
             browserManager.setEventListener(browserId, user.id, async (event) => {
               wsSend(event);
+              if (event.type === 'clipboard_updated' && event.clipboard && typeof event.clipboard.text === 'string') {
+                wsSend({
+                  type: 'clipboard_content',
+                  text: event.clipboard.text,
+                  source: event.clipboard.source || 'clipboard_updated'
+                });
+              }
 
             // 当 tab 切换时，更新 stream/input 引用
             if (event.type === 'tab_switched') {
               const page = browserManager.getActivePage(browserId, user.id);
               if (page) {
                 updateActivePage(page);
+                mcpService.ensureClipboardHook(browserId, user.id, page)
+                  .catch((e) => logger.warn(browserId, `clipboardHook(tab_switched) failed: ${e.message}`));
                 // 重操作异步化，避免阻塞 tab 切换后的首帧恢复
                 fileService.setupDownloadHandling(page, browserId, user.id)
                   .catch((e) => logger.warn(browserId, `setupDownloadHandling(tab_switched) failed: ${e.message}`));
@@ -1672,6 +1951,8 @@ wss.on('connection', async (ws, req) => {
                 const sess = browserManager.getSession(browserId, user.id);
                 if (sess) {
                   for (const tab of sess.tabs) {
+                    mcpService.ensureClipboardHook(browserId, user.id, tab.page)
+                      .catch((e) => logger.warn(browserId, `clipboardHook(tabs_updated) failed: ${e.message}`));
                     fileService.setupDownloadHandling(tab.page, browserId, user.id)
                       .catch((e) => logger.warn(browserId, `setupDownloadHandling(tabs_updated) failed: ${e.message}`));
                   }
@@ -1696,6 +1977,10 @@ wss.on('connection', async (ws, req) => {
             (async () => {
               try {
                 await setupFileHandlingForAllTabs(browserId, user.id, session);
+                for (const tab of session.tabs) {
+                  mcpService.ensureClipboardHook(browserId, user.id, tab.page)
+                    .catch((e) => logger.warn(browserId, `clipboardHook(connect) failed: ${e.message}`));
+                }
                 fileService.setListener(browserId, user.id, (event) => {
                   wsSend(event);
                   if (event.type === 'download_ready' || (event.type === 'download_progress' && event.state === 'completed')) {
@@ -2211,6 +2496,17 @@ wss.on('connection', async (ws, req) => {
 });
 
 // SPA 路由回退
+app.all(`${config.mcp.routePrefix}/:browserId/*`, (req, res) => {
+  res.status(404).json({
+    error: 'Unknown MCP endpoint',
+    hint: `Use ${config.mcp.routePrefix}/:browserId for JSON-RPC, or known tool paths from /api/mcp/help`
+  });
+});
+
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
+});
+
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'client', 'dist', 'index.html'));
 });
