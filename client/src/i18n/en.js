@@ -328,7 +328,7 @@ export default {
     username: 'Username',
     password: 'Password',
     token: 'Token',
-    tokenHint: 'Default uses current login token from browser localStorage.',
+    tokenHint: 'Browser-level API token (manual rotate only, independent of login session).',
     generateGuide: 'Generate Guide',
     copyGuide: 'Copy Markdown',
     downloadGuide: 'Download .md',
@@ -341,12 +341,12 @@ export default {
     fullApiHint: 'All routes below are full URLs, ready to call directly.',
     mcpJsonTitle: 'MCP Server JSON',
     copyMcpJson: 'Copy MCP JSON',
-    reloadToken: 'Reload token from session',
+    reloadToken: 'Reload browser token',
     copyToken: 'Copy token',
-    newToken: 'New token',
-    newTokenTitle: 'New token',
-    newTokenDesc: 'Get a fresh JWT token via login API (writes to this browser local session).',
-    newTokenMissing: 'Please enter username and password',
+    newToken: 'Rotate token',
+    newTokenTitle: 'Rotate token',
+    newTokenDesc: 'Generate a new browser-level API token manually. Old token becomes invalid immediately.',
+    newTokenMissing: 'No extra input required',
     newTokenFailed: 'Failed to get token'
   }
 }

@@ -118,16 +118,6 @@
             <button class="modal-close" @click="closeNewTokenModal">&times;</button>
           </div>
           <p class="desc">{{ t('toolsHelp.newTokenDesc') }}</p>
-          <div class="form-grid token-modal-grid">
-            <label>
-              <span>{{ t('toolsHelp.username') }}</span>
-              <input v-model.trim="newTokenForm.username" class="input" type="text" autocomplete="username" />
-            </label>
-            <label>
-              <span>{{ t('toolsHelp.password') }}</span>
-              <input v-model="newTokenForm.password" class="input" type="password" autocomplete="current-password" />
-            </label>
-          </div>
           <div v-if="newTokenError" class="error-message">{{ newTokenError }}</div>
           <div class="modal-footer">
             <button class="btn btn-secondary" @click="closeNewTokenModal">{{ t('common.cancel') }}</button>
@@ -154,10 +144,9 @@ const selectedHelpType = ref('mcp')
 const guideForm = ref({
   serverBaseUrl: window.location.origin || 'http://127.0.0.1:3000',
   browserId: 'test',
-  token: localStorage.getItem('token') || ''
+  token: ''
 })
 const showNewTokenModal = ref(false)
-const newTokenForm = ref({ username: '', password: '' })
 const newTokenError = ref('')
 
 const normalizedBaseUrl = computed(() => {
@@ -356,30 +345,34 @@ function applyRoutePreset() {
 }
 
 function reloadTokenFromSession() {
-  guideForm.value.token = localStorage.getItem('token') || ''
-  generateGuide()
+  loadBrowserAccessToken()
 }
 
 function closeNewTokenModal() {
   showNewTokenModal.value = false
   newTokenError.value = ''
-  newTokenForm.value = { username: '', password: '' }
+}
+
+async function loadBrowserAccessToken() {
+  newTokenError.value = ''
+  try {
+    const browserId = currentBrowserId.value
+    const resp = await api.get(`/api/browsers/${encodeURIComponent(browserId)}/access-token`)
+    const token = String(resp.data?.apiToken || '')
+    guideForm.value.token = token
+    generateGuide()
+  } catch (e) {
+    newTokenError.value = e.response?.data?.error || e.message || t('toolsHelp.newTokenFailed')
+  }
 }
 
 async function requestNewToken() {
   newTokenError.value = ''
-  const username = String(newTokenForm.value.username || '').trim()
-  const password = String(newTokenForm.value.password || '')
-  if (!username || !password) {
-    newTokenError.value = t('toolsHelp.newTokenMissing')
-    return
-  }
   try {
-    const resp = await api.post('/api/auth/login', { username, password })
-    const token = resp.data?.token || ''
+    const browserId = currentBrowserId.value
+    const resp = await api.post(`/api/browsers/${encodeURIComponent(browserId)}/access-token/rotate`)
+    const token = String(resp.data?.apiToken || '')
     if (!token) throw new Error('No token returned')
-    localStorage.setItem('token', token)
-    if (resp.data?.user) localStorage.setItem('user', JSON.stringify(resp.data.user))
     guideForm.value.token = token
     closeNewTokenModal()
     generateGuide()
@@ -432,6 +425,7 @@ onMounted(async () => {
     const resp = await api.get('/api/browser-tools/catalog')
     tools.value = resp.data.tools || []
     routePrefix.value = resp.data.routePrefix || '/api/mcp'
+    await loadBrowserAccessToken()
     if (tools.value.length > 0 && !guideMarkdown.value) {
       generateGuide()
     }
@@ -444,6 +438,7 @@ watch(
   () => [route.params?.mode, route.query?.browserId, route.query?.helpType],
   () => {
     applyRoutePreset()
+    loadBrowserAccessToken()
     generateGuide()
   }
 )

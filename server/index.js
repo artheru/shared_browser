@@ -215,17 +215,29 @@ function getMcpEndpoint(req, browserId) {
 
 function getMcpServerJson(req, browserId) {
   const endpoint = getMcpEndpoint(req, browserId);
+  const tokenHint = '<browser-api-token>';
   return {
     mcpServers: {
       [browserId]: {
         transport: 'http',
         url: endpoint,
         headers: {
-          Authorization: 'Bearer <token>'
+          Authorization: `Bearer ${tokenHint}`
         }
       }
     }
   };
+}
+
+function ensureBrowserReadableByUser(req, res, browserId) {
+  if (req.user?.isAdmin) return true;
+  const userRecord = userApi.getById(req.user?.id);
+  const allowed = userRecord?.allowedBrowsers || [];
+  if (!allowed.includes(browserId)) {
+    res.status(403).json({ error: 'No access to this browser' });
+    return false;
+  }
+  return true;
 }
 
 app.get('/api/browsers/:id/mcp-endpoint', authMiddleware, (req, res) => {
@@ -233,13 +245,51 @@ app.get('/api/browsers/:id/mcp-endpoint', authMiddleware, (req, res) => {
   if (!browser) {
     return res.status(404).json({ error: 'Browser not found' });
   }
+  if (!ensureBrowserReadableByUser(req, res, browser.id)) return;
+  const tokenInfo = browserApi.getAccessToken(browser.id);
   res.json({
     browserId: browser.id,
     mcpEnabled: !!browser.mcpEnabled,
     webApiEnabled: !!browser.webApiEnabled,
+    apiToken: tokenInfo.apiToken,
+    apiTokenUpdatedAt: tokenInfo.apiTokenUpdatedAt,
     endpoint: getMcpEndpoint(req, browser.id),
     mcpServerJson: getMcpServerJson(req, browser.id)
   });
+});
+
+app.get('/api/browsers/:id/access-token', authMiddleware, (req, res) => {
+  try {
+    const browser = browserApi.getById(req.params.id);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserReadableByUser(req, res, browser.id)) return;
+    const tokenInfo = browserApi.getAccessToken(browser.id);
+    res.json({
+      browserId: browser.id,
+      apiToken: tokenInfo.apiToken,
+      apiTokenUpdatedAt: tokenInfo.apiTokenUpdatedAt,
+      tokenLength: String(tokenInfo.apiToken || '').length
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/browsers/:id/access-token/rotate', authMiddleware, (req, res) => {
+  try {
+    const browser = browserApi.getById(req.params.id);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserReadableByUser(req, res, browser.id)) return;
+    const tokenInfo = browserApi.rotateAccessToken(browser.id, 8);
+    res.json({
+      browserId: browser.id,
+      apiToken: tokenInfo.apiToken,
+      apiTokenUpdatedAt: tokenInfo.apiTokenUpdatedAt,
+      tokenLength: String(tokenInfo.apiToken || '').length
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 app.get('/api/browser-tools/catalog', authMiddleware, (req, res) => {
@@ -678,6 +728,8 @@ function canonicalToolId(toolIdRaw) {
   const name = String(toolIdRaw || '');
   if (name === 'input') return 'keyboard';
   if (name === 'view_clipboard') return 'viewClipboard';
+  if (name === 'tab_list') return 'tablist';
+  if (name === 'tabs_list') return 'tabs_list';
   return name;
 }
 
@@ -862,6 +914,19 @@ function getMcpToolSchemas() {
       properties: {},
       additionalProperties: false
     },
+    tablist: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    },
+    navigate: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Target URL to open in current active tab.' }
+      },
+      required: ['url'],
+      additionalProperties: true
+    },
     tabs_select: {
       type: 'object',
       properties: {
@@ -970,6 +1035,16 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
     case 'tabs_list':
       await browserManager.alignActiveTab(browserId, userId);
       return browserManager.getTabList(browserId, userId);
+    case 'tablist':
+      await browserManager.alignActiveTab(browserId, userId);
+      return browserManager.getTabList(browserId, userId);
+    case 'navigate': {
+      const url = String(args?.url || '').trim();
+      if (!url) throw new Error('url is required');
+      const page = await browserManager.navigateCurrentTab(browserId, userId, url);
+      if (!page) throw new Error('Failed to navigate current tab');
+      return browserManager.getTabList(browserId, userId);
+    }
     case 'tabs_select': {
       const tabIndex = Number(args?.tabIndex);
       if (!Number.isFinite(tabIndex)) throw new Error('tabIndex is required');
@@ -1065,7 +1140,8 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
     }
 
     const method = body.method;
-    const id = body.id ?? null;
+    const hasId = Object.prototype.hasOwnProperty.call(body, 'id');
+    const id = hasId ? body.id : null;
     const params = body.params || {};
 
     if (method === 'initialize') {
@@ -1079,6 +1155,15 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
           version: String(versionInfo.version || 'unknown')
         }
       }));
+    }
+
+    if (method === 'notifications/initialized' && !hasId) {
+      // JSON-RPC notification: no response body to avoid client transport confusion.
+      return res.status(202).end();
+    }
+
+    if (String(method).startsWith('notifications/') && !hasId) {
+      return res.status(202).end();
     }
 
     if (method === 'notifications/initialized') {
@@ -1270,6 +1355,48 @@ app.get(`${config.mcp.routePrefix}/:browserId/tabs`, authMiddleware, async (req,
     if (!ensureToolEnabled(res, browser, 'tabs_list')) return;
 
     await browserManager.alignActiveTab(browserId, req.user.id);
+    const data = browserManager.getTabList(browserId, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/tablist`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'tablist');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'tablist')) return;
+
+    await browserManager.alignActiveTab(browserId, req.user.id);
+    const data = browserManager.getTabList(browserId, req.user.id);
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/navigate`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'navigate');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'navigate')) return;
+
+    const url = String(req.body?.url || '').trim();
+    if (!url) return res.status(400).json({ error: 'url is required' });
+    await browserManager.navigateCurrentTab(browserId, req.user.id, url);
     const data = browserManager.getTabList(browserId, req.user.id);
     logToolCallOk(callCtx, data);
     res.json(data);

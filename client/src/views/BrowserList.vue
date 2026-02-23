@@ -343,6 +343,7 @@ const selectedToolsBrowser = ref(null)
 const toolsStatus = ref({
   mcpEnabled: false,
   webApiEnabled: false,
+  apiToken: '',
   endpoint: '',
   mcpServerJson: {},
   tools: []
@@ -362,7 +363,7 @@ const formError = ref('')
 const mcpServerJsonText = computed(() => {
   if (!toolsStatus.value.mcpServerJson) return ''
   const clone = JSON.parse(JSON.stringify(toolsStatus.value.mcpServerJson))
-  const token = localStorage.getItem('token') || '<token>'
+  const token = toolsStatus.value.apiToken || '<browser-api-token>'
   const browserKey = Object.keys(clone.mcpServers || {})[0]
   if (browserKey) {
     clone.mcpServers[browserKey].headers.Authorization = `Bearer ${token}`

@@ -1441,6 +1441,56 @@ class BrowserManager {
     return page;
   }
 
+  async navigateCurrentTab(browserId, userId, url) {
+    const key = this._getSessionKey(browserId, userId);
+    const session = this.userSessions.get(key);
+    if (!session || !Array.isArray(session.tabs) || session.tabs.length === 0) {
+      throw new Error('No active tab available');
+    }
+
+    const targetUrl = String(url || '').trim();
+    if (!targetUrl) {
+      throw new Error('url is required');
+    }
+
+    const activeIndex = Math.min(
+      Math.max(0, Number(session.activeIndex || 0)),
+      Math.max(0, session.tabs.length - 1)
+    );
+    session.activeIndex = activeIndex;
+    const tab = session.tabs[activeIndex];
+    if (!tab || !tab.page) {
+      throw new Error('Active tab is unavailable');
+    }
+
+    const browserConfig = browserApi.getById(browserId);
+    const user = this._resolveUserForTabOwner(tab.owner || userId);
+    const check = isUrlAllowedForUser(targetUrl, browserConfig, user);
+    if (!check.allowed) {
+      this._emitEvent(key, {
+        type: 'domain_blocked',
+        blockedUrl: targetUrl,
+        allowedDomains: browserConfig?.domainRestrictions || []
+      });
+      throw new Error('Navigation blocked by domain policy');
+    }
+
+    tab.url = targetUrl;
+    tab.title = 'Loading...';
+    tab.isReady = false;
+    this._emitTabsUpdated(key);
+
+    await tab.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    tab.url = tab.page.url() || targetUrl;
+    tab.title = await tab.page.title().catch(() => tab.title || 'New Tab');
+    tab.isReady = true;
+
+    this._emitTabsUpdated(key);
+    streamService.ensureWarmupSession(browserId, tab.page);
+    this.touchBrowser(browserId);
+    return tab.page;
+  }
+
   async createNewTab(browserId, userId, url) {
     const key = this._getSessionKey(browserId, userId);
     const session = this.userSessions.get(key);

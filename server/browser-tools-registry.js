@@ -42,6 +42,20 @@ const TOOL_DEFINITIONS = [
     apiMethod: 'GET'
   },
   {
+    id: 'tablist',
+    name: 'Tab List',
+    description: 'List all tabs with url/title and indicate current active tab',
+    mcpPath: 'tablist',
+    apiMethod: 'GET'
+  },
+  {
+    id: 'navigate',
+    name: 'Navigate',
+    description: 'Navigate current active tab to a target URL',
+    mcpPath: 'navigate',
+    apiMethod: 'POST'
+  },
+  {
     id: 'tabs_select',
     name: 'Tabs Select',
     description: 'Switch active tab by index',

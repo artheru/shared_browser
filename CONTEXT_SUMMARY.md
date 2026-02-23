@@ -106,3 +106,60 @@
 - Deployed with phrase `jackie18`:
   - `/api/version` -> `2026.02.22-140435-jackie18`
 
+## 2026-02-23
+- API/MCP token model updated to browser-scoped short token:
+  - token length is now fixed to 8 chars by default
+  - token is stored in browser data (`server/data/browsers.json`) as `apiToken`
+  - token no longer depends on login session/JWT lifecycle
+  - token rotates only by manual action (`/api/browsers/:id/access-token/rotate`)
+- Added browser token management APIs:
+  - `GET /api/browsers/:id/access-token`
+  - `POST /api/browsers/:id/access-token/rotate`
+- MCP compatibility fix for Codex/rmcp handshake:
+  - `notifications/initialized` (and other notification-only methods without `id`) now return `202` with empty body (no JSON-RPC result body)
+- MCP/WebAPI auth enhancement:
+  - `/api/mcp/:browserId/*` now accepts browser-level API token in `Authorization: Bearer <apiToken>` (JWT still supported)
+- UI guide update:
+  - ToolsHelp token source switched from local JWT to browser token API
+  - “New token” now does manual rotate (no login credential modal)
+  - MCP JSON sample now uses `Bearer <browser-api-token>` hint
+- Local validation completed:
+  - browser token smoke test: stable token, 8-char length, rotate changes token
+  - handshake test on local `:3301`: `initialize -> 200`, `notifications/initialized -> 202 (empty)`
+  - WebAPI auth test: `GET /api/mcp/test/clipboard/view` with browser token returned `200`
+- Remote deploy + validation on `192.168.0.190` completed:
+  - deployed package version `2026.02.23-075519`
+  - verified `/api/version` now reports new build
+  - validated browser token on remote: length `8`
+  - validated MCP handshake on remote: `initialize=200`, `notifications/initialized=202`
+  - validated MCP/API loop on `browserId=test` with screenshot + pointer + keyboard
+  - evidence saved under `ai-deck/tmp/`:
+    - `deploy-gui-before.png`
+    - `deploy-gui-run-command.png`
+    - `mcp-loop-before.png`
+    - `mcp-loop-after.png`
+- Codex CLI verification on `192.168.0.146`:
+  - fixed runtime prerequisites (Node upgraded to `v20.18.1`, reinstalled `@openai/codex`)
+  - configured MCP server entry `shared-browser-test` to `http://192.168.0.190:3000/api/mcp/test`
+  - ran `codex exec` with MCP enabled; server started/ready and tool invocation succeeded
+- Added tab reuse navigation capability:
+  - new tool `navigate`: navigate current active tab to a URL (no new-tab required)
+  - new tool `tablist`: list tabs with url/title and active index (alias style alongside existing `tabs_list`)
+  - exposed in both MCP JSON-RPC and WebAPI routes
+- Remote deploy verified with phrase `jackie19nav`:
+  - `/api/version` -> `2026.02.23-084352-jackie19nav`
+  - `tablist` + `navigate` tested on `browserId=test`
+  - MCP tools/list confirms both tools are available
+  - evidence in `ai-deck/tmp/`:
+    - `nav-loop-before.png`
+    - `nav-loop-after-forced.png`
+    - `nav-deploy-winr-after.png`
+- Browser token identity fix (session sync):
+  - browser token no longer creates pseudo-user `browser-token`
+  - browser token now only validates browser access, then executes as admin identity
+  - this keeps MCP/API operations in admin session (`test_1`) so UI tab state and AI operations stay synchronized
+- Remote deploy verified with phrase `jackie20sync`:
+  - `/api/version` -> `2026.02.23-090148-jackie20sync`
+  - report shows tab owners as `admin` (no `browser-token` owner)
+  - browser-token `tabs/new` and `tabs/select` are immediately reflected in admin `tablist`
+

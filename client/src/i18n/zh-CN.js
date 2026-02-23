@@ -328,7 +328,7 @@ export default {
     username: '用户名',
     password: '密码',
     token: 'Token',
-    tokenHint: '默认读取当前登录用户的本地 token。',
+    tokenHint: '浏览器级 API token（仅手动轮换，与登录会话无关）。',
     generateGuide: '生成说明',
     copyGuide: '复制 Markdown',
     downloadGuide: '下载 .md',
@@ -341,12 +341,12 @@ export default {
     fullApiHint: '下面展示的是可直接调用的完整 URL（已包含 browserId）。',
     mcpJsonTitle: 'MCP Server JSON',
     copyMcpJson: '复制 MCP JSON',
-    reloadToken: '从当前会话读取 token',
+    reloadToken: '重新读取浏览器 token',
     copyToken: '复制 token',
-    newToken: '新建 token',
-    newTokenTitle: '新建 token',
-    newTokenDesc: '通过登录接口重新获取一枚 JWT token（会写入本浏览器本地会话）。',
-    newTokenMissing: '请输入用户名和密码',
+    newToken: '轮换 token',
+    newTokenTitle: '轮换 token',
+    newTokenDesc: '手动生成新的浏览器级 API token。旧 token 会立即失效。',
+    newTokenMissing: '无需额外输入',
     newTokenFailed: '获取 token 失败'
   }
 }

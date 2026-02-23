@@ -194,9 +194,7 @@
   - `GET /api/mcp/test` works (with bearer token)
   - `POST /api/mcp/test` `initialize` returns server info/version
   - `tools/list` returns 8 tools
-  - `tools/call` (`dev_html`) returns content + structuredContent
-
-## 2026-02-21 MCP parameter descriptions + tab tools (jackie5)
+  - `tools/call` (`dev_html`) returns content + structuredContent## 2026-02-21 MCP parameter descriptions + tab tools (jackie5)
 - Request:
   - MCP tool parameter descriptions should be explicit (no `No description` in client UI).
   - AI must be able to access/select tabs through both MCP and WebAPI endpoints.
@@ -560,3 +558,226 @@
     - API (admin): `Example Domain...`, len 128
     - MCP (user2): `Example Domain...`, len 128
   - confirms API route now follows same latest browser clipboard state as MCP
+
+## 2026-02-23 Browser-scoped short token + Codex MCP handshake hardening
+- User request:
+  1) API token too long; 8 chars is enough.
+  2) Token must not auto-refresh with session/JWT; only manual rotate, bound to browser data.
+  3) Codex MCP fails with `resources/list failed ... initialized notification ... Transport channel closed`.
+
+- Server changes:
+  - `server/auth.js`
+    - added browser API token generator (`generateBrowserApiToken`) using `crypto.randomBytes`
+    - normalized browser data loading to ensure each browser has `apiToken` + `apiTokenUpdatedAt`
+    - added browser token APIs in `browserApi`:
+      - `getAccessToken(id)`
+      - `rotateAccessToken(id, length=8)`
+    - `browserApi.create()` now initializes browser-level token
+    - `authMiddleware` fallback path:
+      - for `/api/mcp/:browserId/*`, if JWT verify fails, try browser-level token match
+      - on success, request is authenticated as browser-token mode
+  - `server/index.js`
+    - `getMcpServerJson()` hint changed to `Bearer <browser-api-token>`
+    - added helper `ensureBrowserReadableByUser()` for per-browser visibility checks
+    - enhanced `GET /api/browsers/:id/mcp-endpoint` response:
+      - includes `apiToken`, `apiTokenUpdatedAt`
+    - added routes:
+      - `GET /api/browsers/:id/access-token`
+      - `POST /api/browsers/:id/access-token/rotate`
+    - MCP JSON-RPC notification handling hardened:
+      - if request has no `id` and method is `notifications/*`, return `202` empty body
+      - specifically fixes `notifications/initialized` compatibility for strict clients (Codex/rmcp style)
+
+- Client changes:
+  - `client/src/views/ToolsHelp.vue`
+    - token source switched from `localStorage JWT` to browser token API (`/api/browsers/:id/access-token`)
+    - reload button now reloads browser token
+    - “new token” action now calls manual rotate endpoint (`/access-token/rotate`)
+    - removed username/password form dependency for token generation flow
+  - `client/src/views/BrowserList.vue`
+    - MCP JSON preview now fills `Authorization` with browser token (`toolsStatus.apiToken`) instead of local JWT
+    - added `apiToken` in `toolsStatus` local state
+  - i18n updates:
+    - `client/src/i18n/en.js`
+    - `client/src/i18n/zh-CN.js`
+    - token-related text updated to browser-scoped/manual-rotate semantics
+
+- Local verification:
+  - Lint:
+    - `ReadLints` on edited files: no errors
+  - Client build:
+    - `npm run client:build` passed
+  - Browser token behavior smoke test:
+    - `node -e` test confirmed:
+      - length=8
+      - stable across repeated get
+      - rotate returns changed token with length=8
+  - MCP handshake behavior test (local server on port `3301`):
+    - `initialize` -> HTTP `200`
+    - `notifications/initialized` (no id) -> HTTP `202`, empty body
+  - MCP WebAPI route auth with browser token:
+    - `GET /api/mcp/test/clipboard/view` -> HTTP `200`
+
+- Notes:
+  - Port `3000` on this machine pointed to another running service in the environment; used local isolated server on `3301` for deterministic handshake validation.
+
+## 2026-02-23 Deploy and remote verification (`192.168.0.190` + `192.168.0.146`)
+- Target:
+  - deploy latest local changes to `192.168.0.190`
+  - verify MCP/API with screenshot + pointer/keyboard loop
+  - run Codex CLI on `192.168.0.146` to validate MCP startup path
+
+- Deployment path:
+  - `deploy.ps1` direct run was blocked because `VehicleHelper /api/ai/terminal/*` repeatedly timed out (`408`) and `/api/ai/status` was unstable.
+  - workaround used:
+    1) built package already produced by deploy flow: `deploy-package.zip` (version `2026.02.23-075519`)
+    2) uploaded package via `POST /api/ai/files/upload` to:
+       - `C:\\shared-browser\\deploy-package.zip`
+    3) used VehicleHelper GUI input path (mouse/keyboard + screenshot loop) to run deploy command in remote PowerShell:
+       - `taskkill /f /im node.exe; Expand-Archive -Path 'C:\\shared-browser\\deploy-package.zip' -DestinationPath 'C:\\shared-browser' -Force; cd C:\\shared-browser; node server/index.js`
+    4) verified service version:
+       - `GET http://192.168.0.190:3000/api/version` => `2026.02.23-075519`
+
+- Evidence (remote GUI + test loop screenshots in `ai-deck/tmp/`):
+  - `deploy-gui-before.png`
+  - `deploy-gui-after.png`
+  - `deploy-gui-run-command.png`
+  - `mcp-loop-before.png`
+  - `mcp-loop-after.png`
+
+- Remote MCP/API verification (`192.168.0.190`):
+  - login/admin OK
+  - browser token endpoint:
+    - `GET /api/browsers/test/access-token` -> token length `8` (example: `ZknLvnw5`)
+  - browser token auth on MCP/API route:
+    - `GET /api/mcp/test/clipboard/view` -> `ok=true`
+  - JSON-RPC handshake:
+    - `POST /api/mcp/test` `initialize` -> `200`
+    - `POST /api/mcp/test` `notifications/initialized` (no id) -> `202`, empty body
+  - tool loop on Test browser:
+    - screenshot -> pointer -> keyboard (`pgdn`) -> screenshot
+    - pointer/keyboard API responses return `ok=true`
+
+- Codex CLI test on `192.168.0.146`:
+  - initial failure:
+    - Node `v12.22.9` too old for installed Codex CLI (`Unexpected reserved word`)
+  - remediation:
+    - upgraded node using `n` to `v20.18.1`
+    - reinstalled Codex:
+      - `npm install -g @openai/codex@latest`
+  - validation:
+    - `codex --version` -> `codex-cli 0.104.0`
+    - MCP server added:
+      - `codex mcp add shared-browser-test --url http://192.168.0.190:3000/api/mcp/test --bearer-token-env-var SB_TOKEN`
+    - `codex exec` run succeeded with MCP startup logs:
+      - `mcp startup: ready: shared-browser-test, codex_apps`
+      - MCP tool call succeeded (`shared-browser-test.tabs_list`)
+      - returned final tool count output: `17`
+
+## 2026-02-23 Add `tablist` and `navigate` tools (tab reuse navigation)
+- User request:
+  - Agent should not rely only on `tabs_new(url)` for page access.
+  - Need:
+    - `tablist`: list all tabs (url/title) and indicate current active tab.
+    - `navigate`: navigate current tab to target URL.
+
+- Server implementation:
+  - `server/browser-tools-registry.js`
+    - added tool definitions:
+      - `tablist` (`GET /api/mcp/:browserId/tablist`)
+      - `navigate` (`POST /api/mcp/:browserId/navigate`)
+  - `server/browser-manager.js`
+    - added `navigateCurrentTab(browserId, userId, url)`:
+      - resolves current active tab
+      - enforces domain policy via `isUrlAllowedForUser`
+      - navigates with `page.goto(..., waitUntil: domcontentloaded)`
+      - updates tab meta/title/url and emits tabs updates
+  - `server/index.js`
+    - MCP schema additions:
+      - `tablist` (no args)
+      - `navigate` (`url` required)
+    - MCP dispatcher additions in `executeMcpToolCall`:
+      - `tablist` -> same tab list payload (`tabs`, `activeIndex`, etc.)
+      - `navigate` -> navigate current tab and return updated tab list
+    - WebAPI routes added:
+      - `GET /api/mcp/:browserId/tablist`
+      - `POST /api/mcp/:browserId/navigate`
+
+- Docs:
+  - `AI_USAGE.md` updated:
+    - route list includes `tablist` and `navigate`
+    - tab operations section includes `tablist` example and navigate payload
+
+- Build/deploy:
+  - built with phrase: `jackie19nav`
+    - local build version: `2026.02.23-084352-jackie19nav`
+  - uploaded package to remote:
+    - `C:\\shared-browser\\deploy-package.zip`
+  - because VehicleHelper terminal endpoints remained unstable, used GUI execution path:
+    - Win+R + keyboard command to run:
+      - `taskkill /f /im node.exe`
+      - `tar -xf C:\\shared-browser\\deploy-package.zip -C C:\\shared-browser`
+      - `node server/index.js`
+  - deployment verification:
+    - `GET http://192.168.0.190:3000/api/version` -> `2026.02.23-084352-jackie19nav`
+
+- Remote functional tests (`browserId=test`):
+  - browser token length remains 8.
+  - `GET /api/mcp/test/tablist`:
+    - returns `tabs` array with `url/title`
+    - includes `activeIndex`
+  - `POST /api/mcp/test/navigate` with `https://example.com`:
+    - active tab url/title updated to `https://example.com/` / `Example Domain`
+  - MCP JSON-RPC tests:
+    - `tools/list` contains `tablist` and `navigate`
+    - `tools/call` for `navigate` returns structured result successfully
+  - screenshot + pointer/keyboard loop executed and evidence saved:
+    - `ai-deck/tmp/nav-loop-before.png`
+    - `ai-deck/tmp/nav-loop-after.png` (live frame path may lag)
+    - `ai-deck/tmp/nav-loop-after-forced.png` (`useLiveFrame=false`, shows Example Domain)
+    - `ai-deck/tmp/nav-deploy-winr-after.png`
+
+## 2026-02-23 Browser-token identity correction (run as admin session)
+- User clarification:
+  - MCP access via browser token should NOT appear as `browser-token` user.
+  - Browser token is only for browser authorization; runtime actions should run as admin so admin UI can observe all AI operations.
+  - Tab switch/new tab done by AI should sync to user UI tab state.
+
+- Root cause:
+  - `authMiddleware` fallback for browser token set:
+    - `req.user.id = 'browser-token'`
+    - this created a separate session key (`test_browser-token`) and separated tab/runtime state from admin UI (`test_1`).
+
+- Fix:
+  - `server/auth.js`
+    - added `resolveAdminIdentity()`:
+      - prefers `username=admin && isAdmin=true`
+      - fallback to first admin, then first user
+    - browser-token fallback now:
+      - validates token against `browser.apiToken`
+      - sets `req.user` to resolved admin identity
+      - sets `req.authMode='browser-token-admin'` and `req.browserTokenBrowserId`
+    - removed pseudo identity usage for browser token path
+
+- Deploy:
+  - built with phrase: `jackie20sync`
+    - version: `2026.02.23-090148-jackie20sync`
+  - remote deploy (`192.168.0.190`) via VehicleHelper:
+    - upload zip through `/api/ai/files/upload`
+    - GUI Win+R command to restart service with updated files
+  - verified:
+    - `GET /api/version` returns `jackie20sync`
+
+- Validation of requested behavior:
+  - Session/owner:
+    - `GET /api/admin/report` for browser `test` shows:
+      - tab `ownerName=admin`
+      - session key only `test_1`
+      - no `browser-token` owner/session
+  - Tab sync (browser token -> admin UI/session):
+    - call `POST /api/mcp/test/tabs/new` with browser token
+    - admin JWT `GET /api/mcp/test/tablist` count increased immediately (`1 -> 2`)
+    - active index matched in both views
+    - call `POST /api/mcp/test/tabs/select` with browser token (`tabIndex=0`)
+    - admin JWT `tablist.activeIndex` becomes `0` immediately
+  - This confirms AI tab create/switch operations now synchronize with admin-visible session state.

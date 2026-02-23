@@ -77,6 +77,8 @@ For browser `everything`, route pattern is:
 - `POST /api/mcp/everything/paste`
 - `GET  /api/mcp/everything/clipboard/view`
 - `GET  /api/mcp/everything/tabs`
+- `GET  /api/mcp/everything/tablist`
+- `POST /api/mcp/everything/navigate`
 - `POST /api/mcp/everything/tabs/select`
 - `POST /api/mcp/everything/tabs/new`
 - `POST /api/mcp/everything/tabs/close`
@@ -200,6 +202,21 @@ List tabs:
 ```bash
 curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/tabs" \
   -H "Authorization: Bearer <token>"
+```
+
+Alias list route (same data shape):
+
+```bash
+curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/tablist" \
+  -H "Authorization: Bearer <token>"
+```
+
+Navigate current active tab:
+
+```json
+{
+  "url": "https://example.com"
+}
 ```
 
 Select tab:

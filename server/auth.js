@@ -2,9 +2,34 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const config = require('./config');
 const { normalizeToolAccess } = require('./browser-tools-registry');
 const { normalizeDomainRestrictions } = require('./domain-policy');
+
+function generateBrowserApiToken(length = 8) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const size = Math.max(8, Number(length) || 8);
+  const bytes = crypto.randomBytes(size);
+  let out = '';
+  for (let i = 0; i < size; i++) {
+    out += chars[bytes[i] % chars.length];
+  }
+  return out;
+}
+
+function resolveAdminIdentity() {
+  const data = readUsers();
+  const users = Array.isArray(data?.users) ? data.users : [];
+  const preferred = users.find((u) => u && u.username === 'admin' && u.isAdmin);
+  const admin = preferred || users.find((u) => u && u.isAdmin) || users[0];
+  if (!admin) return null;
+  return {
+    id: String(admin.id),
+    username: String(admin.username || 'admin'),
+    isAdmin: true
+  };
+}
 
 // 确保数据目录存在
 function ensureDataDir() {
@@ -47,11 +72,23 @@ function readBrowsers() {
     return defaultBrowsers;
   }
   const data = JSON.parse(fs.readFileSync(config.browsersFile, 'utf-8'));
-  data.browsers = (data.browsers || []).map((browser) => ({
-    ...browser,
-    toolAccess: normalizeToolAccess(browser.toolAccess),
-    domainRestrictions: normalizeDomainRestrictions(browser.domainRestrictions)
-  }));
+  let dirty = false;
+  data.browsers = (data.browsers || []).map((browser) => {
+    const next = {
+      ...browser,
+      toolAccess: normalizeToolAccess(browser.toolAccess),
+      domainRestrictions: normalizeDomainRestrictions(browser.domainRestrictions)
+    };
+    if (!next.apiToken || String(next.apiToken).length < 8) {
+      next.apiToken = generateBrowserApiToken(8);
+      next.apiTokenUpdatedAt = new Date().toISOString();
+      dirty = true;
+    }
+    return next;
+  });
+  if (dirty) {
+    fs.writeFileSync(config.browsersFile, JSON.stringify(data, null, 2));
+  }
   return data;
 }
 
@@ -112,6 +149,24 @@ function authMiddleware(req, res, next) {
     req.user = decoded;
     next();
   } catch (err) {
+    // Fallback: browser-level MCP/API token for /api/mcp/:browserId routes.
+    const m = String(req.path || '').match(/^\/api\/mcp\/([^\/?#]+)/);
+    if (m) {
+      const browserId = decodeURIComponent(m[1] || '');
+      const browser = browserApi.getById(browserId);
+      if (browser && String(browser.apiToken || '') === String(token)) {
+        // Browser API token only authorizes target browser; runtime identity is admin
+        // so MCP/API actions stay in the same admin session/tabs stream as UI.
+        const adminIdentity = resolveAdminIdentity();
+        if (!adminIdentity) {
+          return res.status(500).json({ error: 'No admin user available' });
+        }
+        req.user = adminIdentity;
+        req.authMode = 'browser-token-admin';
+        req.browserTokenBrowserId = browserId;
+        return next();
+      }
+    }
     return res.status(401).json({ error: 'Invalid authentication token' });
   }
 }
@@ -259,6 +314,7 @@ const browserApi = {
       hasPassword: !!b.password,
       mcpEnabled: !!b.mcpEnabled,
       webApiEnabled: !!b.webApiEnabled,
+      hasApiToken: !!b.apiToken,
       toolAccess: normalizeToolAccess(b.toolAccess),
       domainRestrictions: normalizeDomainRestrictions(b.domainRestrictions)
     }));
@@ -276,6 +332,9 @@ const browserApi = {
       hasPassword: !!browser.password,
       mcpEnabled: !!browser.mcpEnabled,
       webApiEnabled: !!browser.webApiEnabled,
+      hasApiToken: !!browser.apiToken,
+      apiToken: browser.apiToken || '',
+      apiTokenUpdatedAt: browser.apiTokenUpdatedAt || null,
       toolAccess: normalizeToolAccess(browser.toolAccess),
       domainRestrictions: normalizeDomainRestrictions(browser.domainRestrictions)
     };
@@ -312,6 +371,8 @@ const browserApi = {
       password: password ? await bcrypt.hash(password, 10) : null,
       mcpEnabled: !!mcpEnabled,
       webApiEnabled: !!webApiEnabled,
+      apiToken: generateBrowserApiToken(8),
+      apiTokenUpdatedAt: new Date().toISOString(),
       toolAccess: normalizeToolAccess(),
       domainRestrictions: normalizeDomainRestrictions(domainRestrictions)
     };
@@ -326,6 +387,9 @@ const browserApi = {
       hasPassword: !!newBrowser.password,
       mcpEnabled: !!newBrowser.mcpEnabled,
       webApiEnabled: !!newBrowser.webApiEnabled,
+      hasApiToken: !!newBrowser.apiToken,
+      apiToken: newBrowser.apiToken,
+      apiTokenUpdatedAt: newBrowser.apiTokenUpdatedAt,
       toolAccess: normalizeToolAccess(newBrowser.toolAccess),
       domainRestrictions: normalizeDomainRestrictions(newBrowser.domainRestrictions)
     };
@@ -379,8 +443,41 @@ const browserApi = {
       hasPassword: !!data.browsers[index].password,
       mcpEnabled: !!data.browsers[index].mcpEnabled,
       webApiEnabled: !!data.browsers[index].webApiEnabled,
+      hasApiToken: !!data.browsers[index].apiToken,
+      apiToken: data.browsers[index].apiToken || '',
+      apiTokenUpdatedAt: data.browsers[index].apiTokenUpdatedAt || null,
       toolAccess: normalizeToolAccess(data.browsers[index].toolAccess),
       domainRestrictions: normalizeDomainRestrictions(data.browsers[index].domainRestrictions)
+    };
+  },
+
+  getAccessToken(id) {
+    const data = readBrowsers();
+    const browser = data.browsers.find(b => b.id === id);
+    if (!browser) throw new Error('Browser not found');
+    if (!browser.apiToken || String(browser.apiToken).length < 8) {
+      browser.apiToken = generateBrowserApiToken(8);
+      browser.apiTokenUpdatedAt = new Date().toISOString();
+      saveBrowsers(data);
+    }
+    return {
+      browserId: browser.id,
+      apiToken: browser.apiToken,
+      apiTokenUpdatedAt: browser.apiTokenUpdatedAt || null
+    };
+  },
+
+  rotateAccessToken(id, length = 8) {
+    const data = readBrowsers();
+    const browser = data.browsers.find(b => b.id === id);
+    if (!browser) throw new Error('Browser not found');
+    browser.apiToken = generateBrowserApiToken(length);
+    browser.apiTokenUpdatedAt = new Date().toISOString();
+    saveBrowsers(data);
+    return {
+      browserId: browser.id,
+      apiToken: browser.apiToken,
+      apiTokenUpdatedAt: browser.apiTokenUpdatedAt
     };
   },
   
