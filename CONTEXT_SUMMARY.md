@@ -162,4 +162,58 @@
   - `/api/version` -> `2026.02.23-090148-jackie20sync`
   - report shows tab owners as `admin` (no `browser-token` owner)
   - browser-token `tabs/new` and `tabs/select` are immediately reflected in admin `tablist`
+- Added detailed human API documentation:
+  - new `API_REFERENCE.md` with auth, endpoint specs, payloads, and curl examples for manual testing
+  - `README.md` now links to `API_REFERENCE.md` and `AI_USAGE.md`
+- Architecture unification update:
+  - WebAPI tool routes now dispatch through `executeMcpToolCall(...)`, same as MCP `tools/call`
+  - guarantees API and MCP execute the same underlying tool function path
+- Pointer compatibility fix for absolute coordinate calls:
+  - `pointer` now accepts shorthand payloads (`x/y`, `startX/startY`, `endX/endY`) in addition to `start/end`
+  - avoids fallback to `(0,0)` when callers omit nested `start/end` object
+- Remote deploy verified with phrase `jackie21docs`:
+  - `/api/version` -> `2026.02.25-214127-jackie21docs`
+- Regression test run (2026-02-25 night):
+  - initial run hit remote instability (`Network.enable timed out`, no active tab), affecting pointer/tab APIs
+  - after `POST /api/browsers/test/restart`, retest passed:
+    - API pointer with top-level `x/y` -> `113,142 -> 113,142`
+    - MCP `tools/call` pointer with top-level `x/y` -> `113,142 -> 113,142`
+    - API navigate and MCP navigate both updated active tab URL correctly
+- GPU acceleration update (local code prepared):
+  - removed hard-disable flags from default launch (`--disable-gpu`, `--disable-accelerated-2d-canvas`, `VizDisplayCompositor` disable path)
+  - added GPU-oriented launch flags by default (configurable by `params.puppeteer.enableGpu=false`)
+  - remote deploy pending because `192.168.0.190:9697` (VehicleHelper) was unavailable during rollout
+- Stage10 input-chain diagnostics on `http://192.168.0.155:8081/`:
+  - reproduced user issue: stage remains `Current Stage:10`, progress `9/19`
+  - event probe confirms `keydown/keypress/keyup` and Enter are dispatched (`isTrusted=true`), but `document.activeElement` remains `BODY`
+  - indicates focus/commit chain issue for ImGui text input path (not pointer coordinate mapping issue)
+  - local fix prepared: canvas selector focus hardening for `pointer`/`keyboard`/`paste` (`tabindex` + `focus()`), pending remote deploy when `:9697` is reachable
+- VehicleHelper recovered; deployed focus hardening with phrase `jackie23stage10`:
+  - `/api/version` -> `2026.02.25-225510-jackie23stage10`
+  - after deployment, selector-based actions now focus canvas successfully (`activeElement = CANVAS`)
+  - Stage10 still blocked at `Current Stage:10 / Progress:9/19` after:
+    - pointer + keyboard(text) + Enter
+    - pointer double-click + paste + Enter
+    - row-coordinate click + keyboard + Enter
+    - row-coordinate click + keyboard + NumpadEnter
+  - evidence:
+    - `ai-deck/tmp/stage10-retest-variant1.png`
+    - `ai-deck/tmp/stage10-retest-variant2.png`
+    - `ai-deck/tmp/stage10-retest-variant3.png`
+    - `ai-deck/tmp/stage10-retest-xy120-160.png`
+    - `ai-deck/tmp/stage10-retest-numpadenter.png`
+
+- Stage10 automation commit-chain fix (selector refocus regression):
+  - implemented `bringToFront()` before `pointer`/`keyboard`/`paste` actions in `server/mcp-service.js` to avoid non-foreground input routing issues
+  - identified root cause for remaining Stage10 failures: repeated `ensureSelectorFocus('#canvas')` refocus can break ImGui input active state during selector-based keyboard flows
+  - fixed by changing `ensureSelectorFocus` to skip `scrollIntoView/focus()` when target is already `document.activeElement` (`alreadyFocused` guard)
+  - deployed and verified with phrase `jackie25selector`:
+    - `/api/version` -> `2026.02.25-231218-jackie25selector`
+  - Stage10 regression retest results:
+    - selector flow now succeeds: `pointer(x=95,y=158 click)` + `keyboard(text='CycleGUI', selector='#canvas', pressEnter=true)` -> `Current Stage:11`, `Progress:10/19`
+  - key evidence in `ai-deck/tmp/`:
+    - `stage10-kb-nosel-step1-click.png`
+    - `stage10-kb-nosel-step2-type.png`
+    - `stage10-kb-nosel-step3-enter.png`
+    - `stage10-selectorflow-jackie25.png`
 

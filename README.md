@@ -71,6 +71,7 @@ shared-browser/
 ├── client/dist/       # Vue.js 前端（构建产物）
 ├── package.json       # 后端依赖
 ├── version.json       # 版本信息
+├── API_REFERENCE.md   # 人类测试用 API 文档
 ├── build.ps1          # 打包脚本 (Windows)
 ├── build.sh           # 打包脚本 (Linux/macOS)
 ├── install.bat        # 安装脚本 (Windows)
@@ -108,6 +109,11 @@ npm run client:build
 # 启动服务
 npm start
 ```
+
+## API 文档
+
+- 人类手工测试（curl/Postman）请看：`API_REFERENCE.md`
+- AI/MCP 使用说明请看：`AI_USAGE.md`
 
 ## 许可证
 

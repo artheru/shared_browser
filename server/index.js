@@ -1230,7 +1230,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/screenshot`, authMiddleware, asyn
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'screenshot')) return;
 
-    const data = await mcpService.screenshot(browserId, req.body || {}, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'screenshot', req.body || {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1249,7 +1249,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/pointer`, authMiddleware, async (
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'pointer')) return;
 
-    const data = await mcpService.pointerAction(browserId, req.body || {}, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'pointer', req.body || {});
     if (data && data.end) {
       browserManager.updateRemoteCursor(browserId, {
         x: data.end.x,
@@ -1276,7 +1276,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/keyboard`, authMiddleware, async 
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'keyboard')) return;
 
-    const data = await mcpService.keyboardInput(browserId, req.body || {}, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'keyboard', req.body || {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1296,7 +1296,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/input`, authMiddleware, async (re
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'keyboard')) return;
 
-    const data = await mcpService.keyboardInput(browserId, req.body || {}, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'keyboard', req.body || {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1315,7 +1315,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/paste`, authMiddleware, async (re
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'paste')) return;
 
-    const data = await mcpService.paste(browserId, req.body || {}, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'paste', req.body || {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1335,7 +1335,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/clipboard/view`, authMiddleware, a
     if (!ensureToolEnabled(res, browser, 'viewClipboard')) return;
 
     const captureSelection = String(req.query.captureSelection || '').toLowerCase() === 'true';
-    const data = await mcpService.viewClipboard(browserId, { captureSelection }, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'viewClipboard', { captureSelection });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1354,8 +1354,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/tabs`, authMiddleware, async (req,
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'tabs_list')) return;
 
-    await browserManager.alignActiveTab(browserId, req.user.id);
-    const data = browserManager.getTabList(browserId, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'tabs_list', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1374,8 +1373,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/tablist`, authMiddleware, async (r
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'tablist')) return;
 
-    await browserManager.alignActiveTab(browserId, req.user.id);
-    const data = browserManager.getTabList(browserId, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'tablist', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1396,8 +1394,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/navigate`, authMiddleware, async 
 
     const url = String(req.body?.url || '').trim();
     if (!url) return res.status(400).json({ error: 'url is required' });
-    await browserManager.navigateCurrentTab(browserId, req.user.id, url);
-    const data = browserManager.getTabList(browserId, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'navigate', { url });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1418,9 +1415,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/tabs/select`, authMiddleware, asy
 
     const tabIndex = Number(req.body?.tabIndex);
     if (!Number.isFinite(tabIndex)) return res.status(400).json({ error: 'tabIndex is required' });
-    const page = await browserManager.switchTab(browserId, req.user.id, tabIndex);
-    if (!page) return res.status(400).json({ error: `Failed to switch tab: ${tabIndex}` });
-    const data = browserManager.getTabList(browserId, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'tabs_select', { tabIndex });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1479,7 +1474,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/video/start`, authMiddleware, asy
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'start_video_recording')) return;
 
-    const data = await videoRecordingService.startRecording(browserId, req.user.id, req.body || {});
+    const data = await executeMcpToolCall(browserId, req.user.id, 'start_video_recording', req.body || {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1498,7 +1493,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/video/list`, authMiddleware, async
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'list_recorded_videos')) return;
 
-    const data = videoRecordingService.listRecordedVideos(browserId);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'list_recorded_videos', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1540,7 +1535,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/downloads`, authMiddleware, async 
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'downloads')) return;
 
-    const data = await mcpService.listDownloads(browserId);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'downloads', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1559,9 +1554,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/downloads/state`, authMiddleware, 
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'downloads_state')) return;
 
-    const files = fileService.getDownloadedFiles(browserId, req.user.id);
-    const active = fileService.getActiveDownloads(browserId, req.user.id);
-    const data = { files, active };
+    const data = await executeMcpToolCall(browserId, req.user.id, 'downloads_state', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1580,7 +1573,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/dev/html`, authMiddleware, async (
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'dev_html')) return;
 
-    const data = await mcpService.getHtml(browserId, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'dev_html', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1600,7 +1593,7 @@ app.get(`${config.mcp.routePrefix}/:browserId/dev/console`, authMiddleware, asyn
     if (!ensureToolEnabled(res, browser, 'dev_console')) return;
 
     const limit = parseInt(req.query.limit, 10) || 200;
-    const data = mcpService.getConsole(browserId, limit);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'dev_console', { limit });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1621,7 +1614,7 @@ app.post(`${config.mcp.routePrefix}/:browserId/dev/eval`, authMiddleware, async 
 
     const script = String(req.body?.script || '');
     if (!script) return res.status(400).json({ error: 'script is required' });
-    const data = await mcpService.evalJs(browserId, script, req.user.id);
+    const data = await executeMcpToolCall(browserId, req.user.id, 'dev_eval', { script });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {

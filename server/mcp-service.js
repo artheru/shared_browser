@@ -326,10 +326,26 @@ class McpService {
 
   async pointerAction(browserId, payload = {}, userId = 'api') {
     const page = await this.getPage(browserId, userId);
+    await page.bringToFront().catch(() => {});
     const mouse = page.mouse;
 
-    const start = await this.resolvePoint(page, payload.start, payload.startSelector);
-    const end = await this.resolvePoint(page, payload.end || start, payload.endSelector);
+    const hasTopLevelXY = Number.isFinite(Number(payload.x)) || Number.isFinite(Number(payload.y));
+    const hasStartXY = Number.isFinite(Number(payload.startX)) || Number.isFinite(Number(payload.startY));
+    const hasTopLevelEndXY = Number.isFinite(Number(payload.endX)) || Number.isFinite(Number(payload.endY));
+
+    const startPoint = payload.start || (
+      hasTopLevelXY
+        ? { x: Number(payload.x || 0), y: Number(payload.y || 0) }
+        : (hasStartXY ? { x: Number(payload.startX || 0), y: Number(payload.startY || 0) } : {})
+    );
+    const endPoint = payload.end || (
+      hasTopLevelEndXY
+        ? { x: Number(payload.endX || 0), y: Number(payload.endY || 0) }
+        : startPoint
+    );
+
+    const start = await this.resolvePoint(page, startPoint, payload.startSelector);
+    const end = await this.resolvePoint(page, endPoint, payload.endSelector);
     const button = payload.button || 'left';
 
     await mouse.move(start.x, start.y);
@@ -366,6 +382,12 @@ class McpService {
         }
       } else {
         await mouse.click(end.x, end.y, { button, clickCount: payload.clickCount || 1 });
+      }
+
+      // If caller clicked a selector target (especially canvas), enforce DOM focus for key routing.
+      const focusSelector = String(payload.endSelector || payload.startSelector || '').trim();
+      if (focusSelector) {
+        await this.ensureSelectorFocus(page, focusSelector);
       }
     }
 
@@ -408,12 +430,44 @@ class McpService {
     return aliases[lowered] || raw;
   }
 
+  async ensureSelectorFocus(page, selector) {
+    const sel = String(selector || '').trim();
+    if (!sel) return { ok: false, reason: 'empty-selector' };
+    try {
+      return await page.$eval(sel, (el) => {
+        // Canvas elements are not focusable by default; make them focusable for key routing.
+        if (el instanceof HTMLCanvasElement && !el.hasAttribute('tabindex')) {
+          el.setAttribute('tabindex', '-1');
+        }
+        const ae = document.activeElement;
+        const alreadyFocused = ae === el;
+        if (!alreadyFocused) {
+          try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+          try { el.focus({ preventScroll: true }); } catch (_) {}
+        }
+        const activeAfter = document.activeElement;
+        return {
+          ok: true,
+          activeTag: activeAfter ? activeAfter.tagName : '',
+          focused: activeAfter === el,
+          alreadyFocused
+        };
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        reason: e?.message || 'focus-failed'
+      };
+    }
+  }
+
   async keyboardInput(browserId, payload = {}, userId = 'api') {
     const page = await this.getPage(browserId, userId);
+    await page.bringToFront().catch(() => {});
     const keyboard = page.keyboard;
     const text = payload.text !== undefined ? String(payload.text) : '';
     if (payload.selector) {
-      await page.focus(payload.selector);
+      await this.ensureSelectorFocus(page, payload.selector);
     }
     if (payload.clearBefore && payload.selector) {
       await page.$eval(payload.selector, (el) => {
@@ -487,8 +541,9 @@ class McpService {
 
   async paste(browserId, payload = {}, userId = 'api') {
     const page = await this.getPage(browserId, userId);
+    await page.bringToFront().catch(() => {});
     if (payload.selector) {
-      await page.focus(payload.selector);
+      await this.ensureSelectorFocus(page, payload.selector);
     }
     const text = payload.text !== undefined ? String(payload.text || '') : '';
     const html = payload.html !== undefined ? String(payload.html || '') : '';

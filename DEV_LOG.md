@@ -757,9 +757,7 @@
       - validates token against `browser.apiToken`
       - sets `req.user` to resolved admin identity
       - sets `req.authMode='browser-token-admin'` and `req.browserTokenBrowserId`
-    - removed pseudo identity usage for browser token path
-
-- Deploy:
+    - removed pseudo identity usage for browser token path- Deploy:
   - built with phrase: `jackie20sync`
     - version: `2026.02.23-090148-jackie20sync`
   - remote deploy (`192.168.0.190`) via VehicleHelper:
@@ -781,3 +779,215 @@
     - call `POST /api/mcp/test/tabs/select` with browser token (`tabIndex=0`)
     - admin JWT `tablist.activeIndex` becomes `0` immediately
   - This confirms AI tab create/switch operations now synchronize with admin-visible session state.
+
+## 2026-02-25 Detailed API docs + API/MCP execution-path unification
+- User request:
+  - provide detailed API docs for human manual testing
+  - ensure API and MCP use the same backend function path
+  - provide evidence
+  - also received AI feedback claiming pointer absolute coords returned `(0,0)` while selector path worked
+
+- Documentation updates:
+  - added `API_REFERENCE.md`
+    - auth flow (JWT + browser token)
+    - per-tool WebAPI endpoints with payload/response examples
+    - MCP JSON-RPC examples (`initialize`, `tools/list`, `tools/call`)
+    - manual repro script guidance
+  - updated `README.md` to link:
+    - `API_REFERENCE.md`
+    - `AI_USAGE.md`
+
+- Architecture changes:
+  - `server/index.js` WebAPI tool routes now execute via `executeMcpToolCall(...)` (same entry as MCP `tools/call`)
+  - unified routes include:
+    - `screenshot`, `pointer`, `keyboard`, `input` alias, `paste`, `viewClipboard`
+    - `tabs`, `tablist`, `navigate`, `tabs/select`, `tabs/new`, `tabs/close`
+    - `start_video_recording`, `list_recorded_videos`
+    - `downloads`, `downloads_state`
+    - `dev_html`, `dev_console`, `dev_eval`
+  - Result: API and MCP channels share the same tool dispatcher and same implementation functions.
+
+- Pointer issue fix (for AI feedback):
+  - Root cause:
+    - `pointerAction` previously expected nested `start/end`, so callers sending only top-level `x/y` could resolve to `(0,0)`.
+  - Fix in `server/mcp-service.js`:
+    - added shorthand compatibility:
+      - start: `x/y` or `startX/startY`
+      - end: `endX/endY`
+    - keeps existing `start/end` object support
+
+- Validation:
+  - local checks:
+    - `node --check server/index.js`
+    - `node --check server/mcp-service.js`
+    - `npm run client:build`
+    - lints clean on modified files
+  - remote deploy to `192.168.0.190`:
+    - built with phrase `jackie21docs`
+    - deployed via VehicleHelper file upload + GUI restart path
+    - `/api/version` => `2026.02.25-214127-jackie21docs`
+  - runtime evidence:
+    - call log (`/api/mcp/calls`) includes both `source=api` and `source=mcp` entries for same tools (`pointer`, `navigate`)
+    - this confirms both channels flow into unified tool dispatch and logging path
+
+## 2026-02-25 Regression test execution (user requested "进行测试")
+- Target host: `192.168.0.190`
+- Scope:
+  - browser token retrieval
+  - API/MCP pointer consistency with top-level `x/y`
+  - API/MCP navigate consistency
+  - calllog source evidence
+- Initial run:
+  - token retrieval OK (`len=8`)
+  - encountered intermittent remote failures:
+    - `tabs/new` timeout
+    - `Network.enable timed out...`
+    - `No active tab available`
+  - calllog still recorded mixed channel sources:
+    - pointer: includes `api` + `mcp`
+    - navigate: includes `api` + `mcp`
+- Recovery:
+  - executed `POST /api/browsers/test/restart` using admin JWT
+  - wait 8s, then reran tests
+- Retest results (pass):
+  - API pointer:
+    - request body `{x:113,y:142,clickAtEnd:true,button:'left'}`
+    - response `start/end = 113,142 -> 113,142`
+  - MCP pointer (`tools/call` same args):
+    - response `start/end = 113,142 -> 113,142`
+  - API navigate:
+    - active tab URL => `https://example.com/?retest-nav=api`
+  - MCP navigate (`tools/call`):
+    - active tab URL => `https://example.com/?retest-nav=mcp`
+
+## 2026-02-25 GPU acceleration investigation (GTX1060 usage concern)
+- User report:
+  - remote host has GTX1060 but Task Manager shows Chrome CPU high / GPU near zero.
+- Findings:
+  - `server/config.js` had explicit GPU-disabling flags:
+    - `--disable-gpu`
+    - `--disable-accelerated-2d-canvas`
+    - plus `--disable-features=...VizDisplayCompositor...`
+  - this configuration can force software path and suppress GPU utilization.
+- Local code fix prepared:
+  - added `gpuEnabled = params.puppeteer?.enableGpu !== false` (default enabled)
+  - when enabled:
+    - remove disable-gpu/disable-2d-canvas path
+    - remove VizDisplayCompositor disable from default features string
+    - add GPU-friendly flags:
+      - `--enable-gpu-rasterization`
+      - `--enable-zero-copy`
+      - `--ignore-gpu-blocklist`
+      - `--force_high_performance_gpu`
+      - Windows extra: `--use-angle=d3d11`
+  - when disabled via params:
+    - keep legacy `--disable-accelerated-2d-canvas` + `--disable-gpu`
+- Validation before deploy:
+  - syntax check passed: `node --check server/config.js`
+  - built package with phrase: `jackie22gpu`
+- Deployment status:
+  - blocked at this time because VehicleHelper endpoint unreachable:
+    - `http://192.168.0.190:9697/version` repeated DOWN
+  - shared-browser service (`:3000`) still reachable and running prior version `jackie21docs`
+- Temporary evidence captured:
+  - saved `chrome://gpu` screenshot before fix deploy:
+    - `ai-deck/tmp/gpu-status-before-fix.png`
+
+## 2026-02-25 Stage10 input commit debugging (`192.168.0.155:8081`)
+- User reported Stage10 blocked despite pointer/text/paste attempts.
+- Reproduction and probe:
+  - navigated to `http://192.168.0.155:8081/` in `browserId=test`
+  - installed runtime input trace hook via `dev/eval` for:
+    - `keydown`, `keypress`, `keyup`, `beforeinput`, `input`, `paste`, `composition*`
+  - executed:
+    - pointer click on `#canvas`
+    - `keyboard(text='CycleGUI')` + `keyboard(key='Enter')`
+    - `paste(text='CycleGUI')` + `keyboard(key='Enter')`
+- Observed evidence:
+  - `document.activeElement` before and after click remains `BODY`
+  - event trace shows key events delivered with `isTrusted=true`, target/body = `BODY`
+  - screenshot confirms UI still `Current Stage:10`, `Progress: 9/19`
+    - `ai-deck/tmp/stage10-input-debug.png`
+  - explicit coordinate attempt also still blocked:
+    - pointer `(113,142)` then type+enter
+    - screenshot `ai-deck/tmp/stage10-click113142-type-enter.png`
+- Conclusion:
+  - pointer coordinate mapping is no longer the blocker here
+  - blocker is input commit path/focus routing for canvas/ImGui stage
+- Local fix prepared in code (`server/mcp-service.js`):
+  - added `ensureSelectorFocus(page, selector)`
+    - for canvas selector, auto set `tabindex='-1'`, then `focus()`
+  - wired into:
+    - `keyboardInput` (when `selector` provided)
+    - `paste` (when `selector` provided)
+    - `pointerAction` after selector click (`startSelector/endSelector`)
+- Deploy status:
+  - initially blocked because VehicleHelper endpoint `192.168.0.190:9697` unavailable.
+  - after recovery, deployed build with phrase `jackie23stage10`.
+
+## 2026-02-25 Stage10 retest after deployed focus hardening (`jackie23stage10`)
+- Deploy verify:
+  - `/api/version` => `2026.02.25-225510-jackie23stage10`
+- Behavior change confirmed:
+  - before fix: active element stayed `BODY`
+  - after fix: active element in selector flows became `CANVAS#canvas`
+- Regression matrix executed on `http://192.168.0.155:8081/`:
+  1) `pointer(#canvas click)` + `keyboard(selector=#canvas,text=CycleGUI)` + `keyboard(selector=#canvas,key=Enter)`
+  2) `pointer(#canvas double click)` + `paste(selector=#canvas,text=CycleGUI)` + `keyboard(selector=#canvas,key=Enter)`
+  3) `pointer(x=113,y=142 click)` + `keyboard(selector=#canvas,text=CycleGUI)` + `keyboard(selector=#canvas,key=Enter)`
+  4) `pointer(x=120,y=160 double click)` + `keyboard(text=CycleGUI,pressEnter=true)`
+  5) same as #4 but `key=NumpadEnter`
+- Results:
+  - all variants still show:
+    - `Current Stage:10`
+    - `Progress: 9/19 stages completed`
+  - input text is now visible in the Stage10 input row (`CycleGUI`) in coordinate variants (#4/#5), proving text entry reached UI
+  - Enter/NumpadEnter still does not trigger commit/advance
+- Evidence:
+  - `ai-deck/tmp/stage10-retest-variant1.png`
+  - `ai-deck/tmp/stage10-retest-variant2.png`
+  - `ai-deck/tmp/stage10-retest-variant3.png`
+  - `ai-deck/tmp/stage10-retest-xy120-160.png`
+  - `ai-deck/tmp/stage10-retest-numpadenter.png`
+- Current conclusion:
+  - focus routing issue is partially solved (BODY -> CANVAS fixed)
+  - remaining blocker is Stage10 submit/commit acceptance path for Enter (likely app-side event handling requirement beyond current MCP event sequence)
+
+## 2026-02-25 Stage10 selector-chain fix + deploy (`jackie25selector`)
+- Trigger:
+  - user confirmed manual Enter works; requested continued fixing on automation path.
+- Code changes (`server/mcp-service.js`):
+  1) Added `await page.bringToFront().catch(() => {})` at start of:
+     - `pointerAction(...)`
+     - `keyboardInput(...)`
+     - `paste(...)`
+  2) Hardened `ensureSelectorFocus(...)`:
+     - now computes `alreadyFocused = document.activeElement === target`
+     - skips repeated `scrollIntoView/focus()` when `alreadyFocused=true`
+     - returns `alreadyFocused` in result payload for diagnostics
+- Why:
+  - selector-based keyboard workflows on canvas/ImGui can lose widget-level active edit state if canvas is force-focused again right before typing/Enter.
+  - this manifested as Stage10 staying at `9/19` despite text sometimes showing.
+- Deploy:
+  - built package: `2026.02.25-231218-jackie25selector`
+  - uploaded/restarted via VehicleHelper (`192.168.0.190:9697`)
+  - runtime verify:
+    - `GET /api/version` => phrase `jackie25selector`
+- Retest matrix (`browserId=test`, url `http://192.168.0.155:8081/`):
+  - baseline check with previous failing route reproduced/diagnosed using step screenshots
+  - pass case A (no selector on keyboard):
+    - pointer click input row -> keyboard text -> Enter
+    - result: `Current Stage:11`, `Progress:10/19`
+  - pass case B (selector flow after fix):
+    - pointer click input row -> `keyboard(text='CycleGUI', selector='#canvas', pressEnter=true)`
+    - result: `Current Stage:11`, `Progress:10/19`
+- Evidence files:
+  - `ai-deck/tmp/stage10-step0-load.png`
+  - `ai-deck/tmp/stage10-step1-dblclick.png`
+  - `ai-deck/tmp/stage10-step2-paste.png`
+  - `ai-deck/tmp/stage10-step3-enter.png`
+  - `ai-deck/tmp/stage10-kb-nosel-step1-click.png`
+  - `ai-deck/tmp/stage10-kb-nosel-step2-type.png`
+  - `ai-deck/tmp/stage10-kb-nosel-step3-enter.png`
+  - `ai-deck/tmp/stage10-singlecall-pressenter.png`
+  - `ai-deck/tmp/stage10-selectorflow-jackie25.png`

@@ -21,6 +21,45 @@ function readParamsFile() {
 }
 
 const params = readParamsFile();
+const gpuEnabled = params.puppeteer?.enableGpu !== false;
+
+const puppeteerArgs = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  // ====== 反自动化检测参数 ======
+  '--disable-blink-features=AutomationControlled',   // 隐藏自动化标记（Blink 层）
+  '--disable-features=AutomationControlled,TranslateUI',  // 隐藏自动化标记（Chrome 层）+ 禁用翻译弹窗
+  '--disable-infobars',                              // 禁用 "Chrome正在被自动化" 信息栏
+  '--disable-background-networking',                  // 减少后台网络请求
+  '--disable-default-apps',                           // 禁用默认应用
+  '--disable-extensions',                             // 禁用扩展（避免扩展干扰）
+  '--disable-hang-monitor',                           // 禁用挂起监控
+  '--disable-popup-blocking',                         // 禁用弹窗拦截
+  '--disable-prompt-on-repost',                       // 禁用重新提交提示
+  '--disable-sync',                                   // 禁用同步
+  '--metrics-recording-only',                         // 仅记录指标
+  '--no-first-run',                                   // 跳过首次运行向导
+  '--password-store=basic',                           // 基本密码存储
+  '--use-mock-keychain',                              // 使用模拟密钥链
+  '--lang=zh-CN',
+  '--window-size=1280,720',
+  '--window-position=0,0'
+];
+
+if (gpuEnabled) {
+  puppeteerArgs.push(
+    '--enable-gpu-rasterization',
+    '--enable-zero-copy',
+    '--ignore-gpu-blocklist',
+    '--force_high_performance_gpu'
+  );
+  if (process.platform === 'win32') {
+    puppeteerArgs.push('--use-angle=d3d11');
+  }
+} else {
+  puppeteerArgs.push('--disable-accelerated-2d-canvas', '--disable-gpu');
+}
 
 module.exports = {
   // 服务器配置
@@ -67,31 +106,8 @@ module.exports = {
         : process.platform === 'darwin'
           ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           : '/usr/bin/google-chrome'),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      // ====== 反自动化检测参数 ======
-      '--disable-blink-features=AutomationControlled',   // 隐藏自动化标记（Blink 层）
-      '--disable-features=AutomationControlled,VizDisplayCompositor,TranslateUI',  // 隐藏自动化标记（Chrome 层）+ 禁用翻译弹窗
-      '--disable-infobars',                              // 禁用 "Chrome正在被自动化" 信息栏
-      '--disable-background-networking',                  // 减少后台网络请求
-      '--disable-default-apps',                           // 禁用默认应用
-      '--disable-extensions',                             // 禁用扩展（避免扩展干扰）
-      '--disable-hang-monitor',                           // 禁用挂起监控
-      '--disable-popup-blocking',                         // 禁用弹窗拦截
-      '--disable-prompt-on-repost',                       // 禁用重新提交提示
-      '--disable-sync',                                   // 禁用同步
-      '--metrics-recording-only',                         // 仅记录指标
-      '--no-first-run',                                   // 跳过首次运行向导
-      '--password-store=basic',                           // 基本密码存储
-      '--use-mock-keychain',                              // 使用模拟密钥链
-      '--lang=zh-CN',
-      '--window-size=1280,720',
-      '--window-position=0,0'
-    ],
+    args: puppeteerArgs,
+    enableGpu: gpuEnabled,
     // 真实浏览器 User-Agent（匹配近期 Chrome 版本，避免被标记为过时浏览器）
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
   },
