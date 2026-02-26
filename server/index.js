@@ -3,6 +3,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const multer = require('multer');
 const cors = require('cors');
 
@@ -665,16 +666,96 @@ function inferCallSource(req) {
   return 'api';
 }
 
+function signResourceToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const sig = crypto.createHmac('sha256', String(config.jwtSecret || 'shared-browser-secret-key-change-in-production'))
+    .update(body)
+    .digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifyResourceToken(token) {
+  const raw = String(token || '');
+  const parts = raw.split('.');
+  if (parts.length !== 2) return null;
+  const [body, sig] = parts;
+  const expected = crypto.createHmac('sha256', String(config.jwtSecret || 'shared-browser-secret-key-change-in-production'))
+    .update(body)
+    .digest('base64url');
+  try {
+    const sigBuf = Buffer.from(sig, 'utf-8');
+    const expBuf = Buffer.from(expected, 'utf-8');
+    if (sigBuf.length !== expBuf.length) return null;
+    if (!crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+  } catch (_) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf-8'));
+    const exp = Number(payload?.exp || 0);
+    if (!Number.isFinite(exp) || exp <= Date.now()) return null;
+    return payload;
+  } catch (_) {
+    return null;
+  }
+}
+
+function buildResourceLink(req, browserId, query = {}) {
+  const payload = {
+    browserId: String(browserId || ''),
+    ...query,
+    exp: Date.now() + 15 * 60 * 1000 // 15 minutes
+  };
+  const token = signResourceToken(payload);
+  const qs = new URLSearchParams({ ...query, token }).toString();
+  const relative = `${config.mcp.routePrefix}/${encodeURIComponent(String(browserId || ''))}/dl_res?${qs}`;
+  return {
+    resourceToken: token,
+    resourceUrl: `${req.protocol}://${req.get('host')}${relative}`,
+    resourcePath: relative
+  };
+}
+
+function attachToolResourceLinks(req, browserId, toolName, data) {
+  const tool = canonicalToolId(toolName);
+  if (!data) return data;
+
+  if (tool === 'screenshot' && data.fileId) {
+    return { ...data, ...buildResourceLink(req, browserId, { kind: 'screenshot', fileId: String(data.fileId) }) };
+  }
+  if (tool === 'list_recorded_videos' && Array.isArray(data)) {
+    return data.map((item) => (
+      item && item.fileId
+        ? { ...item, ...buildResourceLink(req, browserId, { kind: 'video', fileId: String(item.fileId) }) }
+        : item
+    ));
+  }
+  if (tool === 'downloads' && data && typeof data === 'object') {
+    const files = Array.isArray(data.files) ? data.files.map((item) => (
+      item && item.name
+        ? { ...item, ...buildResourceLink(req, browserId, { kind: 'download', filename: String(item.name), userId: String(item.userId || '') }) }
+        : item
+    )) : [];
+    const active = Array.isArray(data.active) ? data.active.map((item) => (
+      item && item.filename
+        ? { ...item, ...buildResourceLink(req, browserId, { kind: 'download', filename: String(item.filename), userId: String(item.userId || '') }) }
+        : item
+    )) : [];
+    return { ...data, files, active };
+  }
+  return data;
+}
+
 function summarizeToolResponse(tool, data) {
   if (!data || typeof data !== 'object') return data;
   switch (tool) {
     case 'screenshot':
       return {
-        hasImageBase64: !!data.imageBase64,
-        imageBase64Length: data.imageBase64 ? data.imageBase64.length : 0,
-        width: data.width,
-        height: data.height,
-        format: data.format
+        fileId: data.fileId,
+        filename: data.filename,
+        size: data.size,
+        mimeType: data.mimeType,
+        resourceUrl: data.resourceUrl
       };
     case 'dev_html':
       return {
@@ -686,6 +767,17 @@ function summarizeToolResponse(tool, data) {
       return {
         count: Array.isArray(data.entries) ? data.entries.length : 0
       };
+    case 'navigate': {
+      const tabs = Array.isArray(data.tabs) ? data.tabs : [];
+      const activeIndex = Number.isFinite(Number(data.activeIndex)) ? Number(data.activeIndex) : 0;
+      const activeTab = tabs[activeIndex] || null;
+      return {
+        activeIndex,
+        activeUrl: activeTab?.url || '',
+        activeTitle: activeTab?.title || '',
+        navigationError: activeTab?.lastNavigationError || null
+      };
+    }
     case 'start_video_recording':
       return {
         fileId: data.fileId,
@@ -697,14 +789,10 @@ function summarizeToolResponse(tool, data) {
       return {
         count: Array.isArray(data) ? data.length : 0
       };
-    case 'fetch_video':
+    case 'downloads':
       return {
-        fileId: data.fileId,
-        filename: data.filename,
-        size: data.size,
-        mimeType: data.mimeType,
-        hasContentBase64: !!data.contentBase64,
-        contentBase64Length: data.contentBase64 ? data.contentBase64.length : 0
+        filesCount: Array.isArray(data.files) ? data.files.length : 0,
+        activeCount: Array.isArray(data.active) ? data.active.length : 0
       };
     case 'viewClipboard':
       return {
@@ -719,6 +807,11 @@ function summarizeToolResponse(tool, data) {
         textLength: Number(data.textLength || data.pastedTextLength || 0),
         fileCount: Array.isArray(data.files) ? data.files.length : Number(data.fileCount || 0)
       };
+    case 'pasteFiles':
+      return {
+        mode: data.mode || '',
+        fileCount: Array.isArray(data.files) ? data.files.length : Number(data.fileCount || 0)
+      };
     default:
       return data;
   }
@@ -730,6 +823,7 @@ function canonicalToolId(toolIdRaw) {
   if (name === 'view_clipboard') return 'viewClipboard';
   if (name === 'tab_list') return 'tablist';
   if (name === 'tabs_list') return 'tabs_list';
+  if (name === 'ImportandReadSkillsFirst') return 'ImportandReadSkillsFirst';
   return name;
 }
 
@@ -825,7 +919,8 @@ function getMcpToolSchemas() {
       type: 'object',
       properties: {
         fullPage: { type: 'boolean', description: 'Capture full page (true) or viewport only (false).' },
-        useLiveFrame: { type: 'boolean', description: 'Prefer latest stream frame cache when available.' }
+        useLiveFrame: { type: 'boolean', description: 'Prefer latest stream frame cache when available.' },
+        includeBase64: { type: 'boolean', description: 'Optional compatibility flag. Prefer resourceUrl for binary fetch.' }
       },
       additionalProperties: true
     },
@@ -869,13 +964,17 @@ function getMcpToolSchemas() {
       properties: {
         selector: { type: 'string', description: 'Optional selector to focus before paste.' },
         text: { type: 'string', description: 'Plain text to paste.' },
-        html: { type: 'string', description: 'Optional HTML clipboard content.' },
-        imageBase64: { type: 'string', description: 'Optional image content in base64 (without data URL prefix).' },
-        imageMimeType: { type: 'string', description: 'Image MIME type, for example image/png.' },
-        imageName: { type: 'string', description: 'Filename used for pasted image.' },
+        html: { type: 'string', description: 'Optional HTML clipboard content.' }
+      },
+      additionalProperties: true
+    },
+    pasteFiles: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'Optional selector to focus before file paste.' },
         files: {
           type: 'array',
-          description: 'Optional files to include in paste clipboard.',
+          description: 'Files to include in paste clipboard.',
           items: {
             type: 'object',
             properties: {
@@ -963,20 +1062,7 @@ function getMcpToolSchemas() {
       properties: {},
       additionalProperties: false
     },
-    fetch_video: {
-      type: 'object',
-      properties: {
-        fileId: { type: 'string', description: 'File ID returned by start_video_recording/list_recorded_videos.' }
-      },
-      required: ['fileId'],
-      additionalProperties: true
-    },
     downloads: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false
-    },
-    downloads_state: {
       type: 'object',
       properties: {},
       additionalProperties: false
@@ -1000,6 +1086,11 @@ function getMcpToolSchemas() {
       },
       required: ['script'],
       additionalProperties: true
+    },
+    ImportandReadSkillsFirst: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
     }
   };
 }
@@ -1030,6 +1121,8 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       return await mcpService.keyboardInput(browserId, args || {}, userId);
     case 'paste':
       return await mcpService.paste(browserId, args || {}, userId);
+    case 'pasteFiles':
+      return await mcpService.pasteFiles(browserId, args || {}, userId);
     case 'viewClipboard':
       return await mcpService.viewClipboard(browserId, args || {}, userId);
     case 'tabs_list':
@@ -1041,9 +1134,20 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
     case 'navigate': {
       const url = String(args?.url || '').trim();
       if (!url) throw new Error('url is required');
-      const page = await browserManager.navigateCurrentTab(browserId, userId, url);
-      if (!page) throw new Error('Failed to navigate current tab');
-      return browserManager.getTabList(browserId, userId);
+      try {
+        const page = await browserManager.navigateCurrentTab(browserId, userId, url);
+        if (!page) throw new Error('Failed to navigate current tab');
+        return browserManager.getTabList(browserId, userId);
+      } catch (e) {
+        const tabs = browserManager.getTabList(browserId, userId);
+        if (e && e.details) {
+          return {
+            ...tabs,
+            navigationError: e.details
+          };
+        }
+        throw e;
+      }
     }
     case 'tabs_select': {
       const tabIndex = Number(args?.tabIndex);
@@ -1067,14 +1171,7 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       return await videoRecordingService.startRecording(browserId, userId, args || {});
     case 'list_recorded_videos':
       return videoRecordingService.listRecordedVideos(browserId);
-    case 'fetch_video': {
-      const fileId = String(args?.fileId || '');
-      if (!fileId) throw new Error('fileId is required');
-      return videoRecordingService.getVideoBase64(browserId, fileId);
-    }
-    case 'downloads':
-      return await mcpService.listDownloads(browserId);
-    case 'downloads_state': {
+    case 'downloads': {
       const files = fileService.getDownloadedFiles(browserId, userId);
       const active = fileService.getActiveDownloads(browserId, userId);
       return { files, active };
@@ -1090,6 +1187,8 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       if (!script) throw new Error('script is required');
       return await mcpService.evalJs(browserId, script, userId);
     }
+    case 'ImportandReadSkillsFirst':
+      return mcpService.importAndReadSkillsFirst();
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -1203,7 +1302,8 @@ app.post(`${config.mcp.routePrefix}/:browserId`, authMiddleware, async (req, res
         }
       };
       try {
-        const data = await executeMcpToolCall(browserId, req.user.id, toolNameRaw, params.arguments || {});
+        const dataRaw = await executeMcpToolCall(browserId, req.user.id, toolNameRaw, params.arguments || {});
+        const data = attachToolResourceLinks(req, browserId, toolNameRaw, dataRaw);
         logToolCallOk(callCtx, data);
         return res.json(makeJsonRpcResult(id, makeToolResultContent(data)));
       } catch (e) {
@@ -1230,7 +1330,8 @@ app.post(`${config.mcp.routePrefix}/:browserId/screenshot`, authMiddleware, asyn
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'screenshot')) return;
 
-    const data = await executeMcpToolCall(browserId, req.user.id, 'screenshot', req.body || {});
+    const dataRaw = await executeMcpToolCall(browserId, req.user.id, 'screenshot', req.body || {});
+    const data = attachToolResourceLinks(req, browserId, 'screenshot', dataRaw);
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1316,6 +1417,36 @@ app.post(`${config.mcp.routePrefix}/:browserId/paste`, authMiddleware, async (re
     if (!ensureToolEnabled(res, browser, 'paste')) return;
 
     const data = await executeMcpToolCall(browserId, req.user.id, 'paste', req.body || {});
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/pasteFiles`, authMiddleware, upload.array('files', 20), async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'pasteFiles');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'pasteFiles')) return;
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'files are required' });
+    }
+    const files = req.files.map((f) => ({
+      name: f.originalname,
+      mimeType: f.mimetype || 'application/octet-stream',
+      buffer: f.buffer,
+      size: Number(f.size || f.buffer?.length || 0)
+    }));
+    const data = await executeMcpToolCall(browserId, req.user.id, 'pasteFiles', {
+      selector: req.body?.selector,
+      files
+    });
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1493,32 +1624,10 @@ app.get(`${config.mcp.routePrefix}/:browserId/video/list`, authMiddleware, async
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'list_recorded_videos')) return;
 
-    const data = await executeMcpToolCall(browserId, req.user.id, 'list_recorded_videos', {});
+    const dataRaw = await executeMcpToolCall(browserId, req.user.id, 'list_recorded_videos', {});
+    const data = attachToolResourceLinks(req, browserId, 'list_recorded_videos', dataRaw);
     logToolCallOk(callCtx, data);
     res.json(data);
-  } catch (e) {
-    logToolCallError(callCtx, e);
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.get(`${config.mcp.routePrefix}/:browserId/video/:fileId`, authMiddleware, async (req, res) => {
-  const browserId = req.params.browserId;
-  const fileId = String(req.params.fileId || '');
-  const callCtx = logToolCallStart(req, browserId, 'fetch_video');
-  try {
-    if (!ensureMcpAvailable(res)) return;
-    const browser = browserApi.getById(browserId);
-    if (!browser) return res.status(404).json({ error: 'Browser not found' });
-    if (!ensureBrowserApiModeEnabled(res, browser)) return;
-    if (!ensureToolEnabled(res, browser, 'fetch_video')) return;
-
-    const info = videoRecordingService.getVideoFileInfo(browserId, fileId);
-    logToolCallOk(callCtx, info);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', String(info.size));
-    res.setHeader('Content-Disposition', `attachment; filename="${info.filename}"`);
-    fs.createReadStream(info.path).pipe(res);
   } catch (e) {
     logToolCallError(callCtx, e);
     res.status(400).json({ error: e.message });
@@ -1535,7 +1644,8 @@ app.get(`${config.mcp.routePrefix}/:browserId/downloads`, authMiddleware, async 
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
     if (!ensureToolEnabled(res, browser, 'downloads')) return;
 
-    const data = await executeMcpToolCall(browserId, req.user.id, 'downloads', {});
+    const dataRaw = await executeMcpToolCall(browserId, req.user.id, 'downloads', {});
+    const data = attachToolResourceLinks(req, browserId, 'downloads', dataRaw);
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
@@ -1544,22 +1654,78 @@ app.get(`${config.mcp.routePrefix}/:browserId/downloads`, authMiddleware, async 
   }
 });
 
-app.get(`${config.mcp.routePrefix}/:browserId/downloads/state`, authMiddleware, async (req, res) => {
+app.get(`${config.mcp.routePrefix}/:browserId/ImportandReadSkillsFirst`, authMiddleware, async (req, res) => {
   const browserId = req.params.browserId;
-  const callCtx = logToolCallStart(req, browserId, 'downloads_state');
+  const callCtx = logToolCallStart(req, browserId, 'ImportandReadSkillsFirst');
   try {
     if (!ensureMcpAvailable(res)) return;
     const browser = browserApi.getById(browserId);
     if (!browser) return res.status(404).json({ error: 'Browser not found' });
     if (!ensureBrowserApiModeEnabled(res, browser)) return;
-    if (!ensureToolEnabled(res, browser, 'downloads_state')) return;
-
-    const data = await executeMcpToolCall(browserId, req.user.id, 'downloads_state', {});
+    if (!ensureToolEnabled(res, browser, 'ImportandReadSkillsFirst')) return;
+    const data = await executeMcpToolCall(browserId, req.user.id, 'ImportandReadSkillsFirst', {});
     logToolCallOk(callCtx, data);
     res.json(data);
   } catch (e) {
     logToolCallError(callCtx, e);
     res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/dl_res`, async (req, res) => {
+  try {
+    const payload = verifyResourceToken(req.query?.token);
+    if (!payload) return res.status(401).json({ error: 'Invalid or expired resource token' });
+    const browserId = String(req.params.browserId || '');
+    if (String(payload.browserId || '') !== browserId) {
+      return res.status(403).json({ error: 'Resource token browser mismatch' });
+    }
+    const kind = String(payload.kind || '');
+    if (kind === 'video') {
+      const info = videoRecordingService.getVideoFileInfo(browserId, String(payload.fileId || ''));
+      res.setHeader('Content-Type', info.mimeType || 'video/mp4');
+      res.setHeader('Content-Length', String(info.size));
+      res.setHeader('Content-Disposition', `attachment; filename="${info.filename}"`);
+      return fs.createReadStream(info.path).pipe(res);
+    }
+    if (kind === 'screenshot') {
+      const info = mcpService.getScreenshotFileInfo(browserId, String(payload.fileId || ''));
+      res.setHeader('Content-Type', info.mimeType || 'image/png');
+      res.setHeader('Content-Length', String(info.size));
+      res.setHeader('Content-Disposition', `inline; filename="${info.filename}"`);
+      return fs.createReadStream(info.path).pipe(res);
+    }
+    if (kind === 'download') {
+      const filename = String(payload.filename || '');
+      const userId = String(payload.userId || '');
+      const browser = browserApi.getById(browserId);
+      const isShared = !!(browser && (browser.mcpEnabled || browser.webApiEnabled));
+      let filePath = '';
+      if (isShared) {
+        filePath = userId
+          ? fileService.getDownloadFilePath(browserId, userId, filename)
+          : fileService.getSharedDownloadFilePath(browserId, filename);
+      } else {
+        filePath = fileService.getDownloadFilePath(browserId, userId || 'api', filename);
+      }
+      const stats = fs.statSync(filePath);
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', String(stats.size));
+      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filename)}"`);
+      return fs.createReadStream(filePath).pipe(res);
+    }
+    return res.status(400).json({ error: 'Unsupported resource kind' });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+app.get(`${config.mcp.routePrefix}/:browserId/skills/ImportandReadSkillsFirst`, async (req, res) => {
+  try {
+    const data = mcpService.importAndReadSkillsFirst();
+    return res.json(data);
+  } catch (e) {
+    return res.status(404).json({ error: e.message });
   }
 });
 

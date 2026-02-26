@@ -291,10 +291,9 @@ curl -s "${fullMcpBaseUrl.value}/video/list" \\
   -H "Authorization: Bearer ${token}"
 \`\`\`
 
-### Fetch MP4 by fileId
+### Download MP4 by resourceUrl from video/list
 \`\`\`bash
-curl -L "${fullMcpBaseUrl.value}/video/<fileId>" \\
-  -H "Authorization: Bearer ${token}" \\
+curl -L "<resourceUrl-from-video-list>" \\
   -o recording.mp4
 \`\`\`
 
@@ -302,7 +301,6 @@ curl -L "${fullMcpBaseUrl.value}/video/<fileId>" \\
 \`\`\`json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_video_recording","arguments":{"durationSec":6}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_recorded_videos","arguments":{}}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_video","arguments":{"fileId":"<fileId>"}}}
 \`\`\`
 
 ## Clipboard APIs

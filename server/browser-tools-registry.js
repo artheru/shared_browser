@@ -23,8 +23,15 @@ const TOOL_DEFINITIONS = [
   {
     id: 'paste',
     name: 'Paste',
-    description: 'Paste large text/html/image/files into current focused element',
+    description: 'Paste large text/html into current focused element',
     mcpPath: 'paste',
+    apiMethod: 'POST'
+  },
+  {
+    id: 'pasteFiles',
+    name: 'Paste Files',
+    description: 'Paste/upload files into current focused element',
+    mcpPath: 'pasteFiles',
     apiMethod: 'POST'
   },
   {
@@ -86,29 +93,22 @@ const TOOL_DEFINITIONS = [
   {
     id: 'list_recorded_videos',
     name: 'List Recorded Videos',
-    description: 'List available recorded MP4 files (fileId, size, time)',
+    description: 'List available recorded MP4 files with download resource URLs',
     mcpPath: 'video/list',
-    apiMethod: 'GET'
-  },
-  {
-    id: 'fetch_video',
-    name: 'Fetch Video',
-    description: 'Fetch recorded MP4 by fileId',
-    mcpPath: 'video/:fileId',
     apiMethod: 'GET'
   },
   {
     id: 'downloads',
     name: 'Downloads',
-    description: 'List files downloaded by remote browser sessions',
+    description: 'List downloaded files and in-progress downloads with resource URLs',
     mcpPath: 'downloads',
     apiMethod: 'GET'
   },
   {
-    id: 'downloads_state',
-    name: 'Downloads State',
-    description: 'List downloaded files and in-progress downloads with progress',
-    mcpPath: 'downloads/state',
+    id: 'ImportandReadSkillsFirst',
+    name: 'Import and Read Skills First',
+    description: 'Return capability markdown for VehicleHelper/MCP usage',
+    mcpPath: 'ImportandReadSkillsFirst',
     apiMethod: 'GET'
   },
   {

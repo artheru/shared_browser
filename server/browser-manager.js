@@ -1098,6 +1098,9 @@ class BrowserManager {
       url: page.url() || 'about:blank',
       targetId: String(this._safeTargetIdForPage(page) || ''),
       isReady: (page.url() || 'about:blank') === 'about:blank',
+      lastNavigationTarget: '',
+      lastNavigationAt: null,
+      lastNavigationError: null,
       openedAt: Date.now(),
       pendingDialog: null,
       tabIdentifier,
@@ -1384,6 +1387,9 @@ class BrowserManager {
         url: tab.url || 'about:blank',
         targetId: String(tab.targetId || this._safeTargetIdForPage(tab.page) || ''),
         isReady: this._resolveTabReadyState(tab, index, activeIndex, streamReady),
+        lastNavigationTarget: tab.lastNavigationTarget || '',
+        lastNavigationAt: tab.lastNavigationAt || null,
+        lastNavigationError: tab.lastNavigationError || null,
         hasDialog: !!tab.pendingDialog,
         tabIdentifier: tab.tabIdentifier,
         tab_identifier: tab.tab_identifier || tab.tabIdentifier,
@@ -1478,17 +1484,98 @@ class BrowserManager {
     tab.url = targetUrl;
     tab.title = 'Loading...';
     tab.isReady = false;
+    tab.lastNavigationTarget = targetUrl;
+    tab.lastNavigationAt = new Date().toISOString();
+    tab.lastNavigationError = null;
     this._emitTabsUpdated(key);
 
-    await tab.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    tab.url = tab.page.url() || targetUrl;
-    tab.title = await tab.page.title().catch(() => tab.title || 'New Tab');
-    tab.isReady = true;
+    try {
+      await tab.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      tab.url = tab.page.url() || targetUrl;
+      tab.title = await tab.page.title().catch(() => tab.title || 'New Tab');
+      if (String(tab.url || '').startsWith('chrome-error://')) {
+        const detail = await this._buildNavigationFailureDetail(
+          tab.page,
+          targetUrl,
+          new Error('Chrome displayed an internal error page')
+        );
+        tab.isReady = true;
+        tab.lastNavigationError = detail;
+        this._emitTabsUpdated(key);
+        const err = new Error(`Navigation failed: ${detail.category}${detail.chromeErrorCode ? ` (${detail.chromeErrorCode})` : ''}`);
+        err.details = detail;
+        throw err;
+      }
+      tab.isReady = true;
+      tab.lastNavigationError = null;
+    } catch (e) {
+      const detail = await this._buildNavigationFailureDetail(tab.page, targetUrl, e);
+      tab.url = detail.finalUrl || targetUrl;
+      tab.title = detail.pageTitle || 'Navigation failed';
+      tab.isReady = true;
+      tab.lastNavigationError = detail;
+      this._emitTabsUpdated(key);
+      logger.warn(browserId, `Navigate failed: ${detail.category}`, {
+        userId,
+        targetUrl,
+        finalUrl: detail.finalUrl,
+        chromeErrorCode: detail.chromeErrorCode,
+        reason: detail.reason
+      });
+      const err = new Error(`Navigation failed: ${detail.category}${detail.chromeErrorCode ? ` (${detail.chromeErrorCode})` : ''}`);
+      err.details = detail;
+      throw err;
+    }
 
     this._emitTabsUpdated(key);
     streamService.ensureWarmupSession(browserId, tab.page);
     this.touchBrowser(browserId);
     return tab.page;
+  }
+
+  _extractChromeErrorCode(text = '') {
+    const m = String(text || '').match(/\bERR_[A-Z0-9_]+\b/);
+    return m ? m[0] : '';
+  }
+
+  _classifyNavigationError(errorMessage = '', chromeErrorCode = '') {
+    const msg = String(errorMessage || '').toUpperCase();
+    const code = String(chromeErrorCode || '').toUpperCase();
+    if (msg.includes('TIMEOUT') || code.includes('TIMED_OUT')) return 'timeout';
+    if (code.includes('CONNECTION_REFUSED') || code.includes('ADDRESS_UNREACHABLE')) return 'connection_refused';
+    if (code.includes('NAME_NOT_RESOLVED') || code.includes('DNS')) return 'dns_error';
+    if (code.startsWith('ERR_CERT_') || code.includes('SSL')) return 'tls_certificate';
+    if (code.includes('INTERNET_DISCONNECTED') || code.includes('NETWORK_CHANGED') || code.includes('CONNECTION_RESET')) return 'network_error';
+    return 'navigation_failed';
+  }
+
+  async _buildNavigationFailureDetail(page, targetUrl, error) {
+    let finalUrl = '';
+    let pageTitle = '';
+    let pageText = '';
+    try { finalUrl = String(page.url() || ''); } catch (_) {}
+    if (finalUrl.startsWith('chrome-error://')) {
+      try {
+        const info = await page.evaluate(() => ({
+          title: String(document.title || ''),
+          text: String(document.body?.innerText || '').slice(0, 4000)
+        }));
+        pageTitle = String(info?.title || '');
+        pageText = String(info?.text || '');
+      } catch (_) {}
+    }
+    const chromeErrorCode = this._extractChromeErrorCode(pageText);
+    const reason = String(error?.message || error || '');
+    const category = this._classifyNavigationError(reason, chromeErrorCode);
+    return {
+      category,
+      reason,
+      targetUrl: String(targetUrl || ''),
+      finalUrl: finalUrl || String(targetUrl || ''),
+      chromeErrorCode,
+      pageTitle,
+      at: new Date().toISOString()
+    };
   }
 
   async createNewTab(browserId, userId, url) {

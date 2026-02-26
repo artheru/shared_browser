@@ -991,3 +991,233 @@
   - `ai-deck/tmp/stage10-kb-nosel-step3-enter.png`
   - `ai-deck/tmp/stage10-singlecall-pressenter.png`
   - `ai-deck/tmp/stage10-selectorflow-jackie25.png`
+
+## 2026-02-26 VehicleHelper-190 MCP resource-link protocol update
+- User requirement:
+  - leverage updated VehicleHelper-190 capability model via MCP, avoid large payload transfer
+  - for screenshot/downloads/video list routes return URL+token for direct curl GET/POST transfer
+  - screenshot retention only last 10
+  - remove image/files from `paste`, add dedicated `pasteFiles` POST upload
+  - add `ImportandReadSkillsFirst` and return capability markdown
+- Implemented backend changes:
+  1) `server/index.js`
+     - added signed resource token mechanism (`HMAC-SHA256` with server secret)
+     - added helper to attach resource links to MCP/API outputs:
+       - `screenshot`, `list_recorded_videos`, `fetch_video`, `downloads`, `downloads_state`
+     - changed `GET /api/mcp/:browserId/video/:fileId` to return JSON metadata + `resourceUrl` (no inline stream)
+     - added `GET /api/mcp/:browserId/dl_res` for binary delivery (video/screenshot/download)
+     - added `POST /api/mcp/:browserId/pasteFiles` multipart route
+     - added `GET /api/mcp/:browserId/ImportandReadSkillsFirst`
+     - added alias `GET /api/mcp/:browserId/skills/ImportandReadSkillsFirst`
+  2) `server/mcp-service.js`
+     - added screenshot resource store under `uploads/mcp-screenshots/<browserId>/`
+     - retention limit set to 10 (`maxScreenshotsPerBrowser`)
+     - screenshot now returns metadata (`fileId`, `filename`, `mimeType`, `size`) and only optional base64 if explicitly requested by `includeBase64/inlineBase64`
+     - `paste` now supports text/html only (removed image/files pipeline)
+     - added `pasteFiles(...)` tool handler (accepts files and dispatches paste/file input events)
+     - added `importAndReadSkillsFirst()` reading `ImportandReadSkillsFirst.md`
+  3) `server/browser-tools-registry.js`
+     - updated `paste` description
+     - added `pasteFiles` tool definition
+     - added `ImportandReadSkillsFirst` tool definition
+     - updated `fetch_video` and `downloads_state` descriptions to resource-url model
+  4) docs
+     - added `ImportandReadSkillsFirst.md` capability markdown
+     - updated `AI_USAGE.md` for `pasteFiles`, `dl_res`, and resource URL flow
+- Validation:
+  - syntax checks passed:
+    - `node --check server/index.js`
+    - `node --check server/mcp-service.js`
+    - `node --check server/browser-tools-registry.js`
+  - lint diagnostics: no new issues
+  - local runtime smoke partially blocked by local browser config state (`MCP/WebAPI disabled for this browser`), but endpoint compilation and route wiring are complete
+
+## 2026-02-26 190 deploy + desktop/process proof (non-blind validation)
+- User asked to avoid blind-run and requested desktop/process verification first.
+- VH token/read-skills confirmation:
+  - called `ImportantFirstReadSkills` on VH and verified returned content includes:
+    - plain token line (`Current API/MCP token (plain text): ...`)
+    - explicit header format (`Authorization: Bearer ...`)
+- SB deployment sequence on `192.168.0.190`:
+  - built and deployed:
+    - `jackie27testpage` (testpage parity)
+    - `jackie28skillsfb` (ImportandReadSkillsFirst fallback robustness)
+  - final active version:
+    - `2026.02.26-173332-jackie28skillsfb`
+- Blocking issue discovered and fixed during verification:
+  - remote package did not contain `ai-deck/tmp_script/testpage_node_server.js`
+  - runtime fallback used `test-server/test_page_server.py`, but that file on remote was still old (no `copyJsBtn`)
+  - uploaded updated `test-server/test_page_server.py` via VH file upload and restarted testpage on `127.0.0.1:8877`
+  - re-check marker: `TESTPAGE_COPYBTN:True`
+- Desktop/process/port evidence (to prove not blind):
+  - VH desktop screenshot captured:
+    - `ai-deck/tmp/vh190-desktop-now.png`
+  - process and listening ports from VH terminal:
+    - `node.exe` running `server/index.js`
+    - `python.exe` running `test_page_server.py`
+    - listeners:
+      - `0.0.0.0:3000` (SB)
+      - `127.0.0.1:8877` (testpage)
+- Functional verification after fixes:
+  - prove page is live and selector exists:
+    - `dev/eval` => `url=http://127.0.0.1:8877/testpage`, `hasCopyBtn=true`, `hasPasteFileInput=true`
+    - screenshot with `useLiveFrame=false` saved:
+      - `ai-deck/tmp/sb-v28-proof-notblind.png`
+  - clipboard + paste paths:
+    - click `#copyJsBtn` then `clipboard/view` => `source=clipboard_writeText`, `textLength=8227`
+    - `paste` to `#pasteBox` => text reflected
+    - `pasteFiles` multipart to `#pasteFileInput` => file count `1`, name `pastefile-demo.txt`
+    - response artifact:
+      - `ai-deck/tmp/pasteFiles-res.json`
+  - resource-link routes:
+    - `screenshot` => has `resourceUrl`, no default `imageBase64`
+    - `video/list` entries include `resourceUrl`
+    - `downloads/state` has `files`/`active` arrays
+  - UI evidence:
+    - `ai-deck/tmp/sb-v28-shot2.png`
+
+## 2026-02-26 MCP simplification: merge downloads_state into downloads; remove fetch_video
+- User request:
+  - `downloads_state` no longer needed; merge into `downloads`.
+  - `fetch_video` no longer needed; `list_recorded_videos` should provide resource URL directly.
+  - Redeploy to `192.168.0.190`.
+- Code changes:
+  - `server/browser-tools-registry.js`
+    - removed tools: `fetch_video`, `downloads_state`
+    - updated descriptions:
+      - `list_recorded_videos` now explicitly states items include download resource URLs
+      - `downloads` now states it returns downloaded files + active downloads with resource URLs
+  - `server/index.js`
+    - removed MCP schema entries for `fetch_video` and `downloads_state`
+    - removed dispatcher cases for `fetch_video`; `downloads` now directly returns `{ files, active }`
+    - removed WebAPI routes:
+      - `GET /api/mcp/:browserId/video/:fileId`
+      - `GET /api/mcp/:browserId/downloads/state`
+    - updated resource link attachment:
+      - `downloads` now handles object shape `{files, active}` and attaches `resourceUrl/resourceToken` to both arrays
+    - updated tool response summary for `downloads` to report `filesCount/activeCount`
+  - `server/mcp-service.js`
+    - updated `importAndReadSkillsFirst()` fallback text:
+      - `video/list` only (removed `video/<fileId>`)
+      - `downloads` only (removed `downloads_state`)
+  - Docs:
+    - `AI_USAGE.md`: removed `fetch_video` and `video/<fileId>` references; video download now from `video/list` item resource URL
+    - `ImportandReadSkillsFirst.md`: removed `fetch_video` and `downloads_state`; clarified `downloads` returns `{files, active}`
+    - `client/src/views/ToolsHelp.vue`: removed MCP JSON-RPC example for `fetch_video`; updated curl example to download from `video/list` `resourceUrl`
+- Local checks:
+  - syntax:
+    - `node --check server/index.js`
+    - `node --check server/browser-tools-registry.js`
+    - `node --check server/mcp-service.js`
+  - lints on edited files: no errors
+  - workspace grep: no remaining `fetch_video` / `downloads_state` references in source/docs (except historical logs)
+- Deploy (non-blind) to `192.168.0.190`:
+  - built with phrase: `jackie29dlmerge`
+  - active version confirmed:
+    - `GET /api/version` -> `2026.02.26-180635-jackie29dlmerge`
+  - pre/post desktop screenshots:
+    - `ai-deck/tmp/vh190-predeploy-20260226-180707.png`
+    - `ai-deck/tmp/vh190-postdeploy-20260226-180707.png`
+  - pre/post process+port evidence:
+    - `ai-deck/tmp/vh190-predeploy-proc-20260226-180707.txt`
+    - `ai-deck/tmp/vh190-postdeploy-proc-20260226-180707.txt`
+- Remote regression (MCP/API loop):
+  - test loop screenshots:
+    - `ai-deck/tmp/sb-j29-loop-before.png`
+    - `ai-deck/tmp/sb-j29-loop-after.png`
+  - pointer + keyboard loop: both `ok=true`
+  - `downloads` route:
+    - returns object with both `files` and `active`
+    - `files[*]` include `resourceUrl`
+    - `active[*]` include `resourceUrl` when active entries exist
+  - `video/list` entries include `resourceUrl`
+  - MCP `tools/list` confirms removal:
+    - `fetch_video` absent
+    - `downloads_state` absent
+  - old fetch route check:
+    - `GET /api/mcp/test/video/abc` -> HTTP 404 (expected)
+
+## 2026-02-26 Navigate/chrome-error diagnostics enhancement (`jackie31navdiag2`)
+- User pain point:
+  - navigating to some targets sometimes ends at `chrome-error://chromewebdata/` with no actionable error context.
+  - hard to distinguish timeout/network/service/certificate/policy causes.
+- Backend implementation:
+  - `server/browser-manager.js`
+    - tab state now tracks navigation diagnostics:
+      - `lastNavigationTarget`
+      - `lastNavigationAt`
+      - `lastNavigationError`
+    - `getTabList()` now returns these fields per tab.
+    - `navigateCurrentTab()` now:
+      - records target/time before navigation
+      - detects both explicit `goto` throw and post-goto `chrome-error://chromewebdata/` outcomes
+      - builds structured diagnostic object via `_buildNavigationFailureDetail(...)`
+      - classifies failures (`timeout`, `connection_refused`, `dns_error`, `tls_certificate`, `network_error`, fallback `navigation_failed`)
+      - throws an error carrying `details` while preserving tab diagnostics
+  - `server/index.js`
+    - `executeMcpToolCall('navigate')` now catches navigate errors with `details` and returns tablist payload + top-level `navigationError`
+    - `summarizeToolResponse('navigate')` now includes active tab URL/title and navigationError snapshot
+- Deploy:
+  - built + deployed to `192.168.0.190`:
+    - `2026.02.26-182305-jackie31navdiag2`
+  - non-blind screenshots:
+    - `ai-deck/tmp/vh190-predeploy-navdiag2-20260226-182324.png`
+    - `ai-deck/tmp/vh190-postdeploy-navdiag2-20260226-182324.png`
+- Verification:
+  - success path (`http://192.168.0.189:8081/`):
+    - `navigate` returns no error
+    - active tab URL/title => `http://192.168.0.189:8081/`, `LearnCycleGUI`
+  - forced failure path (`http://192.168.0.189:65530/`):
+    - active tab becomes `chrome-error://chromewebdata/`
+    - API/MCP navigate response now includes structured `navigationError` with:
+      - `category`
+      - `reason`
+      - `targetUrl`
+      - `finalUrl`
+      - `chromeErrorCode` (if detectable)
+      - `pageTitle`
+      - `at`
+    - evidence screenshot:
+      - `ai-deck/tmp/navdiag2-189-65530.png`
+
+## 2026-02-26 Pointer/screenshot stability hardening (`jackie32ptrrecover`)
+- User report:
+  - intermittent fixed error on pointer chain:
+    - `Operation is not valid due to the current state of the object.`
+  - retries often ineffective; pointer + screenshot visual verification loop breaks.
+- Backend changes:
+  - `server/mcp-service.js`
+    - added recoverable-error detection:
+      - `_isRecoverableOperationError(...)`
+    - added one-shot automatic self-heal wrapper:
+      - `_withPageRecovery(browserId, userId, opName, handler)`
+      - on recoverable error:
+        1) `browserManager.alignActiveTab(...)`
+        2) `browserManager.getSessionForUser(...)`
+        3) retry operation once with refreshed page/session
+      - if retry still fails:
+        - throws explicit `<op> failed after recovery retry: ...`
+    - applied wrapper to:
+      - `screenshot(...)`
+      - `pointerAction(...)`
+- Deploy:
+  - built + deployed to `192.168.0.190`:
+    - `2026.02.26-194452-jackie32ptrrecover`
+  - non-blind evidence:
+    - `ai-deck/tmp/vh190-predeploy-ptrrecover-20260226-194514.png`
+    - `ai-deck/tmp/vh190-postdeploy-ptrrecover-20260226-194514.png`
+    - `ai-deck/tmp/vh190-postdeploy-ptrrecover-proc-20260226-194514.txt`
+- Reproduction verification (minimal steps on `http://192.168.0.189:8081/`):
+  - loop content:
+    - pointer move `(200,200)`
+    - pointer click `(200,200)`
+    - keyboard `pgdn`
+    - screenshot
+    - repeated 10 iterations
+  - result:
+    - 10/10 iterations all `moveOk/clickOk/keyboardOk/screenshotOk = true`
+    - no recurrence of `Operation is not valid due to the current state of the object`
+  - evidence screenshots:
+    - `ai-deck/tmp/pointer-repro-1.png` ... `ai-deck/tmp/pointer-repro-10.png`
+- Notes:
+  - calllog may still include historical errors from prior builds; this run on `jackie32ptrrecover` passed the full repro loop.

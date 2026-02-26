@@ -24,9 +24,10 @@ All protected endpoints require:
    - pointer
   - keyboard
   - paste
+  - pasteFiles
   - viewClipboard
    - tabs_list / tabs_select / tabs_new / tabs_close
-   - start_video_recording / list_recorded_videos / fetch_video
+   - start_video_recording / list_recorded_videos
    - dev_html
    - dev_console
    - dev_eval
@@ -84,7 +85,9 @@ For browser `everything`, route pattern is:
 - `POST /api/mcp/everything/tabs/close`
 - `POST /api/mcp/everything/video/start`
 - `GET  /api/mcp/everything/video/list`
-- `GET  /api/mcp/everything/video/<fileId>`
+- `POST /api/mcp/everything/pasteFiles`
+- `GET  /api/mcp/everything/ImportandReadSkillsFirst`
+- `GET  /api/mcp/everything/dl_res?...`
 - `GET  /api/mcp/everything/dev/html`
 - `GET  /api/mcp/everything/dev/console`
 - `POST /api/mcp/everything/dev/eval`
@@ -105,7 +108,11 @@ curl -s -X POST "http://192.168.0.190:3000/api/mcp/<browserId>/screenshot" \
   -d "{}"
 ```
 
-Returns `imageBase64`, `url`, `title`, `dialogs`, `source`.
+Returns metadata + short-lived resource link:
+
+- `fileId`, `filename`, `mimeType`, `size`
+- `resourceUrl`, `resourceToken`
+- `url`, `title`, `dialogs`, `source`
 
 ### 6.2 Pointer click by coordinates
 
@@ -174,18 +181,13 @@ Paste large text:
 }
 ```
 
-Paste image/file (base64):
+Paste files (multipart via dedicated endpoint):
 
-```json
-{
-  "files": [
-    {
-      "name": "sample.png",
-      "mimeType": "image/png",
-      "contentBase64": "<base64>"
-    }
-  ]
-}
+```bash
+curl -X POST "http://192.168.0.190:3000/api/mcp/<browserId>/pasteFiles" \
+  -H "Authorization: Bearer <token>" \
+  -F "selector=#target" \
+  -F "files=@C:/tmp/sample.png"
 ```
 
 View browser clipboard:
@@ -266,12 +268,10 @@ curl -s "http://192.168.0.190:3000/api/mcp/<browserId>/video/list" \
   -H "Authorization: Bearer <token>"
 ```
 
-Fetch MP4:
+Download MP4 by resource URL (from each `video/list` item):
 
 ```bash
-curl -L "http://192.168.0.190:3000/api/mcp/<browserId>/video/<fileId>" \
-  -H "Authorization: Bearer <token>" \
-  -o record.mp4
+curl -L "<resourceUrl>" -o record.mp4
 ```
 
 Retention:
@@ -279,6 +279,10 @@ Retention:
 - Keeps latest `10` recordings by default.
 - Admin can tune via `params.json` -> `recording.maxSavedFiles`.
 - Older files are auto-pruned.
+
+Screenshot retention:
+
+- keeps latest 10 screenshots per browser (older ones auto-removed).
 
 ## 7. Reliable Action Loop (Important)
 

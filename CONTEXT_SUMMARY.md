@@ -217,3 +217,93 @@
     - `stage10-kb-nosel-step3-enter.png`
     - `stage10-selectorflow-jackie25.png`
 
+- VehicleHelper-190 MCP transport enhancement (resource-link mode):
+  - implemented `dl_res` resource endpoint: `GET /api/mcp/:browserId/dl_res?...` with signed short-lived token
+  - `screenshot`, `list_recorded_videos`, `fetch_video`, `downloads`, `downloads_state` now return `resourceUrl` + `resourceToken` (avoid huge base64)
+  - `fetch_video` switched to metadata response; actual binary fetched via `resourceUrl`
+  - `screenshot` now stores only latest 10 per browser (older files auto-pruned)
+  - `paste` simplified to text/html only; added new multipart route/tool `pasteFiles` (`POST /api/mcp/:browserId/pasteFiles`)
+  - added capability doc endpoint/tool:
+    - `GET /api/mcp/:browserId/ImportandReadSkillsFirst`
+    - alias public route `GET /api/mcp/:browserId/skills/ImportandReadSkillsFirst`
+    - source file: `ImportandReadSkillsFirst.md`
+
+- 190 deployment + non-blind verification (`jackie28skillsfb`):
+  - deployed and confirmed `/api/version` -> `2026.02.26-173332-jackie28skillsfb`
+  - validated VH ReadSkills token injection:
+    - `ImportantFirstReadSkills` includes plain token and `Authorization: Bearer ...`
+  - fixed remote testpage mismatch:
+    - remote package lacked `ai-deck/tmp_script/testpage_node_server.js`, so fallback `test-server/test_page_server.py` was running old content
+    - uploaded updated `test_page_server.py` to 190 and restarted `8877` testpage
+  - SB API/MCP verification on 190 passed:
+    - `screenshot` returns `resourceUrl` (default no base64)
+    - `clipboard/view` updated from JS copy (`source=clipboard_writeText`, large text length observed)
+    - `paste` text path works
+    - `pasteFiles` multipart path works (file reflected in target input)
+    - `video/list` entries include `resourceUrl`
+    - `downloads/state` returns expected arrays
+  - evidence files:
+    - `ai-deck/tmp/vh190-desktop-now.png`
+    - `ai-deck/tmp/sb-v28-proof-notblind.png`
+    - `ai-deck/tmp/sb-v28-shot2.png`
+    - `ai-deck/tmp/pasteFiles-res.json`
+
+- MCP interface simplified and redeployed (`jackie29dlmerge`):
+  - removed `fetch_video` tool and route (`/api/mcp/:browserId/video/:fileId`)
+  - removed `downloads_state` tool and route (`/api/mcp/:browserId/downloads/state`)
+  - `downloads` unified to return `{files, active}` with resource URLs/tokens
+  - `list_recorded_videos` remains and each item provides `resourceUrl` for direct download
+  - docs/tool-help updated accordingly (`AI_USAGE.md`, `ImportandReadSkillsFirst.md`, `ToolsHelp.vue`)
+  - deployed to `192.168.0.190`, version:
+    - `2026.02.26-180635-jackie29dlmerge`
+  - non-blind evidence:
+    - `ai-deck/tmp/vh190-predeploy-20260226-180707.png`
+    - `ai-deck/tmp/vh190-postdeploy-20260226-180707.png`
+    - `ai-deck/tmp/vh190-predeploy-proc-20260226-180707.txt`
+    - `ai-deck/tmp/vh190-postdeploy-proc-20260226-180707.txt`
+  - verification:
+    - MCP `tools/list`: `fetch_video` / `downloads_state` no longer present
+    - `GET /api/mcp/test/video/abc` returns 404 (old path removed)
+    - `GET /api/mcp/test/downloads` returns object with `files` and `active`
+    - `GET /api/mcp/test/video/list` entries include `resourceUrl`
+    - loop evidence:
+      - `ai-deck/tmp/sb-j29-loop-before.png`
+      - `ai-deck/tmp/sb-j29-loop-after.png`
+
+- Navigate diagnostics improvement (`jackie31navdiag2`):
+  - objective: avoid opaque `chrome-error://chromewebdata/` outcomes by returning actionable diagnostic fields.
+  - `navigate` now returns/propagates structured `navigationError` (API + MCP) with:
+    - `category`, `reason`, `targetUrl`, `finalUrl`, `chromeErrorCode`, `pageTitle`, `at`
+  - tablist/tabs now include per-tab:
+    - `lastNavigationTarget`, `lastNavigationAt`, `lastNavigationError`
+  - deployed version:
+    - `2026.02.26-182305-jackie31navdiag2`
+  - verification:
+    - success target `http://192.168.0.189:8081/` -> no error, title `LearnCycleGUI`
+    - forced fail `http://192.168.0.189:65530/` -> `chrome-error://chromewebdata/` + populated `navigationError`
+  - evidence:
+    - `ai-deck/tmp/vh190-predeploy-navdiag2-20260226-182324.png`
+    - `ai-deck/tmp/vh190-postdeploy-navdiag2-20260226-182324.png`
+    - `ai-deck/tmp/navdiag2-189-65530.png`
+
+- Pointer/screenshot stability hardening (`jackie32ptrrecover`):
+  - issue addressed: intermittent fixed error during pointer path:
+    - `Operation is not valid due to the current state of the object`
+  - mitigation:
+    - added recoverable-error detection + one-shot auto-recovery wrapper in MCP service
+    - on pointer/screenshot recoverable failure, service now auto realigns active tab/session and retries once
+  - scope:
+    - `pointerAction(...)`
+    - `screenshot(...)`
+  - deployed version:
+    - `2026.02.26-194452-jackie32ptrrecover`
+  - non-blind deployment evidence:
+    - `ai-deck/tmp/vh190-predeploy-ptrrecover-20260226-194514.png`
+    - `ai-deck/tmp/vh190-postdeploy-ptrrecover-20260226-194514.png`
+    - `ai-deck/tmp/vh190-postdeploy-ptrrecover-proc-20260226-194514.txt`
+  - reproduction verification on `http://192.168.0.189:8081/`:
+    - 10-iteration loop (`pointer move + click + keyboard + screenshot`) all passed
+    - no recurrence of the fixed state error
+    - evidence:
+      - `ai-deck/tmp/pointer-repro-1.png` ... `ai-deck/tmp/pointer-repro-10.png`
+

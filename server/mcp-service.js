@@ -5,11 +5,21 @@ const config = require('./config');
 const fileService = require('./file-service');
 const streamService = require('./stream-service');
 
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
 class McpService {
   constructor() {
     this.consoleBuffer = new Map(); // browserId -> [{timestamp,type,text}]
     this.maxConsoleEntries = 500;
     this.clipboardStore = new Map(); // `${browserId}_${userId}` -> { text, html, files, updatedAt, source }
+    this.screenshotRootDir = path.join(config.uploadsDir, 'mcp-screenshots');
+    this.screenshotStore = new Map(); // browserId -> [{ fileId, path, mimeType, size, createdAt }]
+    this.maxScreenshotsPerBrowser = 10;
+    ensureDir(this.screenshotRootDir);
   }
 
   _clipboardKey(browserId, userId = 'api') {
@@ -104,6 +114,37 @@ class McpService {
     }
     await this.ensureClipboardHook(browserId, userId, page);
     return page;
+  }
+
+  _isRecoverableOperationError(error) {
+    const msg = String(error?.message || error || '').toLowerCase();
+    if (!msg) return false;
+    return (
+      msg.includes('operation is not valid due to the current state of the object') ||
+      msg.includes('target closed') ||
+      msg.includes('session closed') ||
+      msg.includes('execution context was destroyed') ||
+      msg.includes('protocol error') ||
+      msg.includes('detached') ||
+      msg.includes('no active page')
+    );
+  }
+
+  async _withPageRecovery(browserId, userId, opName, handler) {
+    try {
+      const page = await this.getPage(browserId, userId);
+      return await handler(page, 1);
+    } catch (e1) {
+      if (!this._isRecoverableOperationError(e1)) throw e1;
+      await browserManager.alignActiveTab(browserId, userId).catch(() => {});
+      await browserManager.getSessionForUser(browserId, userId).catch(() => {});
+      const page2 = await this.getPage(browserId, userId);
+      try {
+        return await handler(page2, 2);
+      } catch (e2) {
+        throw new Error(`${opName} failed after recovery retry: ${e2?.message || e2}`);
+      }
+    }
   }
 
   async ensureClipboardHook(browserId, userId, page) {
@@ -284,30 +325,106 @@ class McpService {
     });
   }
 
-  async screenshot(browserId, options = {}, userId = 'api') {
-    const page = await this.getPage(browserId, userId);
-    let image = '';
-    let source = 'page_capture';
-    const preferLiveFrame = options.useLiveFrame !== false && !options.fullPage;
-    if (preferLiveFrame) {
-      const latest = streamService.getLatestFrame(browserId);
-      if (latest && latest.buffer) {
-        image = latest.buffer.toString('base64');
-        source = 'stream_latest_frame';
+  _detectImageFormat(buffer) {
+    if (!buffer || buffer.length < 4) return { ext: 'bin', mimeType: 'application/octet-stream' };
+    if (buffer.length >= 8 &&
+      buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47 &&
+      buffer[4] === 0x0D && buffer[5] === 0x0A && buffer[6] === 0x1A && buffer[7] === 0x0A
+    ) {
+      return { ext: 'png', mimeType: 'image/png' };
+    }
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[buffer.length - 2] === 0xFF && buffer[buffer.length - 1] === 0xD9) {
+      return { ext: 'jpg', mimeType: 'image/jpeg' };
+    }
+    return { ext: 'bin', mimeType: 'application/octet-stream' };
+  }
+
+  _saveScreenshotResource(browserId, imageBase64) {
+    const browserKey = String(browserId || 'default').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const browserDir = path.join(this.screenshotRootDir, browserKey);
+    ensureDir(browserDir);
+    const buffer = Buffer.from(String(imageBase64 || ''), 'base64');
+    const format = this._detectImageFormat(buffer);
+    const fileId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const filename = `${fileId}.${format.ext}`;
+    const filePath = path.join(browserDir, filename);
+    fs.writeFileSync(filePath, buffer);
+    const entry = {
+      fileId,
+      filename,
+      path: filePath,
+      mimeType: format.mimeType,
+      size: buffer.length,
+      createdAt: new Date().toISOString()
+    };
+    const list = this.screenshotStore.get(browserId) || [];
+    list.unshift(entry);
+    while (list.length > this.maxScreenshotsPerBrowser) {
+      const stale = list.pop();
+      if (stale && stale.path) {
+        try { fs.unlinkSync(stale.path); } catch (_) {}
       }
     }
-    if (!image) {
-      image = await page.screenshot({
-        type: 'png',
-        fullPage: !!options.fullPage,
-        encoding: 'base64'
-      });
-      source = 'page_capture';
+    this.screenshotStore.set(browserId, list);
+    return entry;
+  }
+
+  getScreenshotFileInfo(browserId, fileId) {
+    const list = this.screenshotStore.get(browserId) || [];
+    const item = list.find((x) => x.fileId === String(fileId || ''));
+    if (!item || !item.path || !fs.existsSync(item.path)) {
+      throw new Error('Screenshot not found');
     }
-    const title = await page.title().catch(() => '');
-    const url = page.url();
-    const dialogs = this.getDialogStates(browserId);
-    return { imageBase64: image, title, url, dialogs, source };
+    return {
+      fileId: item.fileId,
+      filename: item.filename,
+      path: item.path,
+      size: item.size,
+      createdAt: item.createdAt,
+      mimeType: item.mimeType
+    };
+  }
+
+  async screenshot(browserId, options = {}, userId = 'api') {
+    return await this._withPageRecovery(browserId, userId, 'screenshot', async (page) => {
+      let image = '';
+      let source = 'page_capture';
+      const preferLiveFrame = options.useLiveFrame !== false && !options.fullPage;
+      if (preferLiveFrame) {
+        const latest = streamService.getLatestFrame(browserId);
+        if (latest && latest.buffer) {
+          image = latest.buffer.toString('base64');
+          source = 'stream_latest_frame';
+        }
+      }
+      if (!image) {
+        image = await page.screenshot({
+          type: 'png',
+          fullPage: !!options.fullPage,
+          encoding: 'base64'
+        });
+        source = 'page_capture';
+      }
+      const title = await page.title().catch(() => '');
+      const url = page.url();
+      const dialogs = this.getDialogStates(browserId);
+      const resource = this._saveScreenshotResource(browserId, image);
+      const out = {
+        fileId: resource.fileId,
+        filename: resource.filename,
+        mimeType: resource.mimeType,
+        size: resource.size,
+        createdAt: resource.createdAt,
+        title,
+        url,
+        dialogs,
+        source
+      };
+      if (options.inlineBase64 === true || options.includeBase64 === true) {
+        out.imageBase64 = image;
+      }
+      return out;
+    });
   }
 
   async resolvePoint(page, point = {}, selector = null) {
@@ -325,77 +442,77 @@ class McpService {
   }
 
   async pointerAction(browserId, payload = {}, userId = 'api') {
-    const page = await this.getPage(browserId, userId);
-    await page.bringToFront().catch(() => {});
-    const mouse = page.mouse;
+    return await this._withPageRecovery(browserId, userId, 'pointer', async (page) => {
+      await page.bringToFront().catch(() => {});
+      const mouse = page.mouse;
 
-    const hasTopLevelXY = Number.isFinite(Number(payload.x)) || Number.isFinite(Number(payload.y));
-    const hasStartXY = Number.isFinite(Number(payload.startX)) || Number.isFinite(Number(payload.startY));
-    const hasTopLevelEndXY = Number.isFinite(Number(payload.endX)) || Number.isFinite(Number(payload.endY));
+      const hasTopLevelXY = Number.isFinite(Number(payload.x)) || Number.isFinite(Number(payload.y));
+      const hasStartXY = Number.isFinite(Number(payload.startX)) || Number.isFinite(Number(payload.startY));
+      const hasTopLevelEndXY = Number.isFinite(Number(payload.endX)) || Number.isFinite(Number(payload.endY));
 
-    const startPoint = payload.start || (
-      hasTopLevelXY
-        ? { x: Number(payload.x || 0), y: Number(payload.y || 0) }
-        : (hasStartXY ? { x: Number(payload.startX || 0), y: Number(payload.startY || 0) } : {})
-    );
-    const endPoint = payload.end || (
-      hasTopLevelEndXY
-        ? { x: Number(payload.endX || 0), y: Number(payload.endY || 0) }
-        : startPoint
-    );
+      const startPoint = payload.start || (
+        hasTopLevelXY
+          ? { x: Number(payload.x || 0), y: Number(payload.y || 0) }
+          : (hasStartXY ? { x: Number(payload.startX || 0), y: Number(payload.startY || 0) } : {})
+      );
+      const endPoint = payload.end || (
+        hasTopLevelEndXY
+          ? { x: Number(payload.endX || 0), y: Number(payload.endY || 0) }
+          : startPoint
+      );
 
-    const start = await this.resolvePoint(page, startPoint, payload.startSelector);
-    const end = await this.resolvePoint(page, endPoint, payload.endSelector);
-    const button = payload.button || 'left';
+      const start = await this.resolvePoint(page, startPoint, payload.startSelector);
+      const end = await this.resolvePoint(page, endPoint, payload.endSelector);
+      const button = payload.button || 'left';
 
-    await mouse.move(start.x, start.y);
+      await mouse.move(start.x, start.y);
 
-    if (payload.pressAtStart) {
-      await mouse.down({ button });
-    }
+      if (payload.pressAtStart) {
+        await mouse.down({ button });
+      }
 
-    if (start.x !== end.x || start.y !== end.y) {
-      await mouse.move(end.x, end.y, { steps: payload.steps || 10 });
-    }
+      if (start.x !== end.x || start.y !== end.y) {
+        await mouse.move(end.x, end.y, { steps: payload.steps || 10 });
+      }
 
-    if (payload.wheelDeltaY || payload.wheelDeltaX) {
-      await mouse.wheel({
-        deltaX: Number(payload.wheelDeltaX || 0),
-        deltaY: Number(payload.wheelDeltaY || 0)
-      });
-    }
+      if (payload.wheelDeltaY || payload.wheelDeltaX) {
+        await mouse.wheel({
+          deltaX: Number(payload.wheelDeltaX || 0),
+          deltaY: Number(payload.wheelDeltaY || 0)
+        });
+      }
 
-    if (payload.clickAtEnd) {
-      if (button === 'middle') {
-        const href = await page.evaluate(({ px, py }) => {
-          const el = document.elementFromPoint(px, py);
-          const link = el && el.closest ? el.closest('a[href]') : null;
-          return link ? link.href : '';
-        }, { px: end.x, py: end.y }).catch(() => false);
+      if (payload.clickAtEnd) {
+        if (button === 'middle') {
+          const href = await page.evaluate(({ px, py }) => {
+            const el = document.elementFromPoint(px, py);
+            const link = el && el.closest ? el.closest('a[href]') : null;
+            return link ? link.href : '';
+          }, { px: end.x, py: end.y }).catch(() => false);
 
-        if (href) {
-          await page.evaluate((url) => {
-            window.open(url, '_blank');
-          }, href);
+          if (href) {
+            await page.evaluate((url) => {
+              window.open(url, '_blank');
+            }, href);
+          } else {
+            await mouse.click(end.x, end.y, { button, clickCount: payload.clickCount || 1 });
+          }
         } else {
           await mouse.click(end.x, end.y, { button, clickCount: payload.clickCount || 1 });
         }
-      } else {
-        await mouse.click(end.x, end.y, { button, clickCount: payload.clickCount || 1 });
+
+        const focusSelector = String(payload.endSelector || payload.startSelector || '').trim();
+        if (focusSelector) {
+          await this.ensureSelectorFocus(page, focusSelector);
+        }
       }
 
-      // If caller clicked a selector target (especially canvas), enforce DOM focus for key routing.
-      const focusSelector = String(payload.endSelector || payload.startSelector || '').trim();
-      if (focusSelector) {
-        await this.ensureSelectorFocus(page, focusSelector);
+      if (payload.releaseAtEnd) {
+        await mouse.up({ button });
       }
-    }
 
-    if (payload.releaseAtEnd) {
-      await mouse.up({ button });
-    }
-
-    return { ok: true, start, end };
+      return { ok: true, start, end };
+    });
   }
 
   _normalizeKey(keyRaw) {
@@ -547,11 +664,7 @@ class McpService {
     }
     const text = payload.text !== undefined ? String(payload.text || '') : '';
     const html = payload.html !== undefined ? String(payload.html || '') : '';
-    const imageBase64 = payload.imageBase64 ? String(payload.imageBase64) : '';
-    const imageMimeType = String(payload.imageMimeType || 'image/png');
-    const extraFiles = Array.isArray(payload.files) ? payload.files : [];
-
-    if (!html && !imageBase64 && extraFiles.length === 0) {
+    if (!html) {
       if (text) {
         await browserManager.pasteText(browserId, userId, text);
         const clip = this._setClipboard(browserId, userId, { text, source: 'paste_text' });
@@ -562,46 +675,14 @@ class McpService {
       return { ok: true, mode: 'insertText', pastedTextLength: String(clip.text || '').length, clipboard: clip };
     }
 
-    const files = [];
-    if (imageBase64) {
-      files.push({
-        name: String(payload.imageName || `pasted-${Date.now()}.png`),
-        mimeType: imageMimeType,
-        contentBase64: imageBase64
-      });
-    }
-    for (const file of extraFiles) {
-      if (!file || !file.contentBase64) continue;
-      files.push({
-        name: String(file.name || `file-${Date.now()}`),
-        mimeType: String(file.mimeType || 'application/octet-stream'),
-        contentBase64: String(file.contentBase64)
-      });
-    }
-
-    const evalResult = await page.evaluate(({ pasteText, pasteHtml, pasteFiles }) => {
-      const toBytes = (b64) => {
-        const binary = atob(b64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        return bytes;
-      };
+    const evalResult = await page.evaluate(({ pasteText, pasteHtml }) => {
       const dt = new DataTransfer();
       if (pasteText) dt.setData('text/plain', pasteText);
       if (pasteHtml) dt.setData('text/html', pasteHtml);
-      for (const f of pasteFiles || []) {
-        const file = new File([toBytes(f.contentBase64)], f.name, { type: f.mimeType || 'application/octet-stream' });
-        dt.items.add(file);
-      }
       const target = document.activeElement || document.body;
       const evt = new Event('paste', { bubbles: true, cancelable: true });
       Object.defineProperty(evt, 'clipboardData', { value: dt });
       const dispatched = target.dispatchEvent(evt);
-
-      if (target instanceof HTMLInputElement && target.type === 'file' && dt.files && dt.files.length > 0) {
-        target.files = dt.files;
-        target.dispatchEvent(new Event('change', { bubbles: true }));
-      }
 
       if ((!dispatched || target instanceof HTMLTextAreaElement || (target instanceof HTMLInputElement && target.type !== 'file')) && pasteText) {
         if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
@@ -615,18 +696,17 @@ class McpService {
       return {
         ok: true,
         dispatched,
-        fileCount: dt.files ? dt.files.length : 0
+        fileCount: 0
       };
     }, {
       pasteText: text,
-      pasteHtml: html,
-      pasteFiles: files
+      pasteHtml: html
     });
 
     this._setClipboard(browserId, userId, {
       text,
       html,
-      files: files.map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      files: [],
       source: 'paste_event'
     });
     return {
@@ -634,7 +714,65 @@ class McpService {
       mode: 'pasteEvent',
       textLength: text.length,
       htmlLength: html.length,
-      files: files.map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      files: [],
+      ...evalResult
+    };
+  }
+
+  async pasteFiles(browserId, payload = {}, userId = 'api') {
+    const page = await this.getPage(browserId, userId);
+    await page.bringToFront().catch(() => {});
+    if (payload.selector) {
+      await this.ensureSelectorFocus(page, payload.selector);
+    }
+    const uploadFiles = Array.isArray(payload.files) ? payload.files : [];
+    if (uploadFiles.length === 0) {
+      throw new Error('files are required');
+    }
+    const filesForPage = uploadFiles.map((f, idx) => ({
+      name: String(f.name || `upload-${idx + 1}`),
+      mimeType: String(f.mimeType || 'application/octet-stream'),
+      contentBase64: Buffer.from(f.buffer || []).toString('base64'),
+      size: Number(f.size || (f.buffer ? f.buffer.length : 0))
+    }));
+    const evalResult = await page.evaluate(({ pasteFiles }) => {
+      const toBytes = (b64) => {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const dt = new DataTransfer();
+      for (const f of pasteFiles || []) {
+        const file = new File([toBytes(f.contentBase64)], f.name, { type: f.mimeType || 'application/octet-stream' });
+        dt.items.add(file);
+      }
+      const target = document.activeElement || document.body;
+      const evt = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(evt, 'clipboardData', { value: dt });
+      const dispatched = target.dispatchEvent(evt);
+      if (target instanceof HTMLInputElement && target.type === 'file' && dt.files && dt.files.length > 0) {
+        target.files = dt.files;
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      return {
+        ok: true,
+        dispatched,
+        fileCount: dt.files ? dt.files.length : 0
+      };
+    }, { pasteFiles: filesForPage });
+    const fileMeta = filesForPage.map((f) => ({ name: f.name, mimeType: f.mimeType, size: f.size }));
+    this._setClipboard(browserId, userId, {
+      text: '',
+      html: '',
+      files: fileMeta.map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      source: 'paste_files'
+    });
+    return {
+      ok: true,
+      mode: 'pasteFiles',
+      fileCount: filesForPage.length,
+      files: fileMeta,
       ...evalResult
     };
   }
@@ -790,6 +928,41 @@ class McpService {
       return eval(src);
     }, script);
     return { value };
+  }
+
+  importAndReadSkillsFirst() {
+    const candidates = [
+      path.join(__dirname, '..', 'ImportandReadSkillsFirst.md'),
+      path.join(process.cwd(), 'ImportandReadSkillsFirst.md'),
+      path.join(__dirname, '..', 'AI_USAGE.md'),
+      path.join(process.cwd(), 'AI_USAGE.md')
+    ];
+    let markdown = '';
+    for (const p of candidates) {
+      if (!p) continue;
+      if (!fs.existsSync(p)) continue;
+      try {
+        markdown = fs.readFileSync(p, 'utf-8');
+        if (markdown) break;
+      } catch (_) {}
+    }
+    if (!markdown) {
+      markdown = [
+        '# ImportandReadSkillsFirst',
+        '',
+        'Use Shared Browser MCP/API with resource links for large data transfer.',
+        '',
+        '- Use `screenshot` and fetch binary via returned `resourceUrl`.',
+        '- Use `video/list` and fetch recordings via each returned `resourceUrl`.',
+        '- Use `downloads` (files + active) and fetch files via `resourceUrl`.',
+        '- Use `paste` for text/html only, and `pasteFiles` for multipart file upload.'
+      ].join('\n');
+    }
+    return {
+      ok: true,
+      name: 'ImportandReadSkillsFirst',
+      markdown
+    };
   }
 
   getDialogStates(browserId) {
