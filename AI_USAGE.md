@@ -30,6 +30,7 @@ All protected endpoints require:
    - start_video_recording / list_recorded_videos
    - dev_html
    - dev_console
+   - devtools
    - dev_eval
 5. Verify result by screenshot + HTML/eval checks.
 
@@ -90,6 +91,7 @@ For browser `everything`, route pattern is:
 - `GET  /api/mcp/everything/dl_res?...`
 - `GET  /api/mcp/everything/dev/html`
 - `GET  /api/mcp/everything/dev/console`
+- `GET|POST /api/mcp/everything/devtools`
 - `POST /api/mcp/everything/dev/eval`
 
 Common headers:
@@ -312,7 +314,8 @@ Avoid issuing many blind actions in batch.
 - For long tasks, periodically verify page URL/title via `dev/eval`.
 - If page logic is complex, combine:
   - `dev/html` for structure
-  - `dev/console` for runtime errors
+  - `devtools` for console/runtime/network/debugger state
+  - `dev/console` for a lighter console-only view
   - `dev/eval` for exact state assertions
 
 ## 10. Security Notes

@@ -1221,3 +1221,181 @@
     - `ai-deck/tmp/pointer-repro-1.png` ... `ai-deck/tmp/pointer-repro-10.png`
 - Notes:
   - calllog may still include historical errors from prior builds; this run on `jackie32ptrrecover` passed the full repro loop.
+## 2026-03-19 Read-skills rewrite + VH146 deployment (`aihelp`)
+- 【注意】本次任务目标是重写 shared_browser 的 `/api/ai/help/read-skills`，要求文案可直接给 AI 使用，且显式带 `token` 和 `browserId`。
+- 【发现】当前代码库里真正生成 read-skills 文案的是 `server/index.js` 内的 `buildSkillsText(...)`；`ToolsHelp.vue` 只是另一套前端帮助文案，不是这次部署验证目标。
+- 【发现】参考源 `D:\src\Vehicraft\VehicleHelper\Program.cs` 的 `ImportantFirstReadSkills` 做得好的点，不是“接口多”，而是：
+  - 顶部先给复制即用的 token / header
+  - 先讲 AI 使用策略，再讲 API
+  - 文案不是堆 curl，而是强调 inspect -> act -> verify 的节奏
+- 【技能】使用了 `writing-plans` 先写计划，计划文件保存为 `docs/superpowers/plans/2026-03-19-rewrite-read-skills-help.md`。
+- 【技能】按 `test-driven-development` 先写 `server/ai-help.test.js`，先看到 `Cannot find module './ai-help'` 红灯，再实现 `server/ai-help.js`。
+- 【注意】为避免继续在巨型字符串里维护文案，新帮助生成逻辑抽到了 `server/ai-help.js`，并在路由层改为：
+  - `buildAiHelpText(base, token, browserId)`
+  - 支持通过 `?browserId=...` 预填帮助内容
+- 【发现】新文案现在具备以下结构：
+  - 顶部复制块：`Read-skills URL` / `Browser API base` / `Authorization header`
+  - AI usage pattern：先浏览器发现，再 inspect，再操作，再验证
+  - 单一 curl 示例：只保留一个 `screenshot` 示例
+  - API reference：每个 API 都写清楚 `Method` / `URL` / `Parameters(Name, Type, Optional?)` / `Returns`
+- 【验证】本地验证通过：
+  - `node --test .\\server\\ai-help.test.js`
+  - 构建版本：`2026.03.19-031830-aihelp`
+- 【发现】处理中途误操作时，误将 `server/index.js` 回滚到 `HEAD`，后来确认：
+  - `HEAD` 里没有 AI Help API 逻辑
+  - 最近构建产物 `shared-browser.zip` 里保留了正确版本
+  - 已从构建产物恢复 `server/index.js`
+- 【发现】远端 `192.168.0.146` 实际结构如下：
+  - `9697` 是 VehicleHelper，不是 shared_browser
+  - `3000` 才是 shared_browser
+  - shared_browser 实际工作目录：`/home/lessokaji/Desktop/gems/shared-browser/app`
+- 【发现】初次 Linux 远端部署失败的根因不是代码，而是 ZIP 路径分隔符：
+  - Windows `Compress-Archive` 产物里的 entry 使用反斜杠
+  - 在 Linux 远端直接 `zipfile.extractall()` 会生成字面量文件名 `server\\index.js`
+  - 并不会覆盖真正的 `server/index.js`
+- 【注意】为修正上述问题，额外下发了远端脚本 `/tmp/extract_shared_browser.py`：
+  - 先删除带反斜杠的错误文件名
+  - 再把 ZIP entry 的 `\\` 统一转成 `/`
+  - 之后再覆盖到 Linux 目录树
+- 【发现】远端配置问题同样阻塞了 read-skills：
+  - shared_browser 的 `aiToken` 只从 `params.json` 读取
+  - 远端 app 根目录最初没有 `params.json`
+  - 已补写 `/home/lessokaji/Desktop/gems/shared-browser/app/params.json`，内容为 `{"aiToken":"123456"}`
+- 【发现】共享 PTY 终端在远端机器上有人类同时使用，导致部署过程中的 `terminal/reset/input/sendkey` 多次被串扰，不适合作为最终重启通道。
+- 【技能】最终采用更稳定的 VehicleHelper 远端能力完成部署：
+  - `/api/ai/files/upload` 上传 `shared-browser.zip`
+  - `/api/ai/files/write` 写入远端修复脚本和配置文件
+  - `/api/files/execute` 调用 `/bin/bash`、`/bin/kill` 完成精准重启
+- 【发现】端口 3000 最终精准占用 PID 为 `50635`；只有直接 kill 这个 PID，再重新 `nohup node server/index.js`，新的 `params.json` 才会真正生效。
+- 【验证】远端 shared_browser 最终验证通过：
+  - `http://192.168.0.146:3000/api/version` 返回 `2026.03.19-031830-aihelp`
+  - `http://192.168.0.146:3000/api/ai/help/read-skills?token=123456&browserId=test-browser` 返回新文案
+  - 文案已包含：`Current token`、`Current browserId`、单一 curl 示例、以及按参数/返回字段展开的 API 说明
+- 【注意】用户给出的目标 URL `http://192.168.0.146:9697/api/ai/help/read-skills?token=123456` 目前仍然是 VehicleHelper 的 `ImportantFirstReadSkills`，不是 shared_browser。
+- 【发现】这不是部署遗漏，而是服务边界不同：
+  - `9697` = VehicleHelper
+  - `3000` = shared_browser
+- 【灵感】如果后续必须让 `9697` 这个 URL 也返回 shared_browser 的新帮助页，可以走两条路：
+  - 修改 VehicleHelper 本体的 `read-skills`
+  - 或在 VehicleHelper 前面增加一层指向 `3000` 的反向代理
+- 【注意】待办已记入 `dev_todo/prd_todo.md`。
+- 【注意】下一步如果用户坚持验证 `9697` 这个 URL，需要切到 VehicleHelper 仓库或网络入口层继续处理，而不是继续修改 shared_browser。
+- 2026-03-19 04:08 台北
+- 【注意】用户补充反馈：`Shared Browser ReadSkills` 的可读性不如旧的 `Guide Preview`，所以这轮不仅删掉预览区，还要把 `/api/ai/help/read-skills` 的顶部结构改成更适合 AI 直接执行的入口文档。
+- 【完成】新增 `client/src/views/tools-help-links.js`，专门生成带 `browserId` 的 ReadSkills 链接。
+- 【完成】新增 `client/src/views/tools-help-links.test.js`，锁定两种场景：
+  - 服务端返回的 skills URL 必须补上 `browserId`
+  - fallback URL 也必须补上 `browserId`
+- 【完成】更新 `client/src/views/ToolsHelp.vue`：
+  - 去掉 `Guide Preview`
+  - 去掉 `Generate Guide` / `Copy Markdown` / `Download .md`
+  - `Read Full API Skills` 链接改为 `...read-skills?token=...&browserId=...`
+  - `skills-url-box` 加 `margin-top: 14px`
+- 【完成】更新 `server/ai-help.js`：
+  - 新增 `## Connection`
+  - 新增 `## AI Action Loop`
+  - 新增 `## Quick Start`
+  - 保留后续 API 参数/返回表，兼顾易读性和完整性
+- 【完成】同步更新文案文件：
+  - `client/src/i18n/en.js`
+  - `client/src/i18n/zh-CN.js`
+- 【验证】本地验证通过：
+  - `node --test server/ai-help.test.js`
+  - `node --test client/src/views/tools-help-links.test.js`
+  - `npm run build`（client）
+  - `.\build.ps1 -Phrase helplink`
+- 【验证】新构建版本：`2026.03.19-040336-helplink`
+- 【技能】继续复用 VehicleHelper 远端能力部署到 VH190：
+  - `/api/ai/files/upload`
+  - `/api/ai/files/write`
+  - `/api/files/execute`
+- 【验证】远端 `http://192.168.0.146:3000` 已更新：
+  - `/api/version` 返回 `2026.03.19-040336-helplink`
+  - `/api/ai/help/read-skills?token=123456&browserId=baidu-test` 返回新的 `Connection / AI Action Loop / Quick Start` 结构
+  - 登录后访问 `/tools-help/api?browserId=baidu-test&helpType=api`，确认页面已去掉预览和三个按钮，且 ReadSkills 链接带上了 `browserId=baidu-test`
+- 【发现】帮助页受登录保护；未登录时会跳回 `/login`，所以最终用实际登录后的 DOM 验证页面结果，而不是只看匿名请求。
+- 【接下来】如果用户还要继续压缩帮助页，只剩两个合理方向：
+  - 继续缩短 `API reference`，只保留最常用 API
+  - 或把 VehicleHelper 的 `9697` 帮助入口也联动过去
+- 2026-03-19 04:14 台北
+- 【注意】用户明确要求把同一版部署到 VH190（`192.168.0.190`），而不是之前已完成的 `192.168.0.146`。
+- 【发现】VH190 当前部署前版本为 `2026.03.19-024447-skillclean`，VehicleHelper `9697` 端口要求 `Authorization: Bearer 123456` 才能访问 `/api/ai/*`。
+- 【完成】复用已构建好的包 `shared-browser.zip`，未重新 build，保持版本助记词为 `helplink`，避免重新打一个无助记词的新包。
+- 【完成】通过 VH190 的 AI 文件接口上传：
+  - `/api/ai/files/upload?path=C:\shared-browser\shared-browser.zip`
+- 【完成】在远端创建部署临时目录并写入说明：
+  - `C:\shared-browser\ai-deck\deploy-vh190\desc.md`
+  - `C:\shared-browser\ai-deck\deploy-vh190\deploy-helplink.ps1`
+- 【完成】远端脚本做了三件事：
+  - 停掉占用 3000 端口的旧进程
+  - `Expand-Archive` 覆盖解压 `C:\shared-browser\shared-browser.zip`
+  - 后台启动 `node server\index.js`
+- 【验证】远端脚本日志 `C:\shared-browser\ai-deck\deploy-vh190\deploy-run.log` 显示：
+  - `deploy start`
+  - `stopping pid=13972`
+  - `archive expanded`
+  - `node start requested`
+- 【验证】VH190 最终验证通过：
+  - `http://192.168.0.190:3000/api/version` 返回 `2026.03.19-040336-helplink`
+  - `http://192.168.0.190:3000/api/ai/help/read-skills?token=123456&browserId=baidu-test` 返回新的 `Connection / AI Action Loop / Quick Start` 结构
+- 【接下来】如果还需要核对登录后页面视觉效果，可直接在 VH190 打开：
+  - `http://192.168.0.190:3000/tools-help/api?browserId=baidu-test&helpType=api`
+- 2026-03-19 04:18 台北
+- 【发现】用户指出一个真实可用性问题：页面上显示的浏览器实际 token 与下方 `Read Full API Skills` 链接里的 token 不一致，复制给 AI 后会直接失效。
+- 【发现】根因已经定位：
+  - 页面里的 token 文本框来自 `/api/browsers/:id/access-token`
+  - 但 `Read Full API Skills` 链接来自 `/api/ai/help/skills-url`
+  - 后者在服务端固定使用 `config.aiToken` 拼接 URL，而不是当前浏览器实际 token
+- 【注意】如果要手动修，前端入口页在 `client/src/views/ToolsHelp.vue`；服务端错误来源在 `server/index.js` 的 `/api/ai/help/skills-url`。
+- 2026-03-19 04:57 台北
+- 【注意】用户要求直接修改，并说明自己已经手动改过 `server/ai-help.js`，去掉了 `ListBrowsers`；本轮修复保留了用户这份改动。
+- 【发现】继续向下追根因后确认：问题不只是前端拼错 token。
+  - 页面 token 文本框来自 `/api/browsers/:id/access-token`
+  - 旧的 ReadSkills 链接来自服务级 `config.aiToken`
+  - `/api/ai/help/read-skills` 的 `aiTokenMiddleware` 之前也只接受 `config.aiToken`
+  - 所以前端即使改成浏览器 token，旧后端也会直接 401
+- 【完成】新增 `server/ai-help-auth.js`，抽出：
+  - `isAllowedAiHelpToken(...)`
+  - `resolveAiHelpDisplayToken(...)`
+- 【完成】新增 `server/ai-help-auth.test.js`，覆盖：
+  - 配置级 `aiToken` 可通过
+  - 浏览器实际 `apiToken` 可通过
+  - 错 token 会拒绝
+  - 浏览器帮助优先回显浏览器实际 token
+- 【完成】更新 `client/src/views/tools-help-links.js`：ReadSkills 链接直接使用当前浏览器 token，不再依赖 `aiSkillsUrl`
+- 【完成】更新 `client/src/views/ToolsHelp.vue`：
+  - `readSkillsUrl` 直接使用 `guideForm.token`
+  - 不再请求 `/api/ai/help/skills-url`
+- 【完成】更新 `server/index.js`：
+  - `aiTokenMiddleware` 现在同时接受 `config.aiToken` 和当前 `browserId` 对应的浏览器 `apiToken`
+  - `/api/ai/help/read-skills` 输出时优先嵌入浏览器实际 token
+- 【完成】更新 `server/ai-help.test.js`，去掉对已删除 `ListBrowsers` 文案的旧断言，保持与用户当前 `ai-help` 输出一致。
+- 【验证】本地验证通过：
+  - `node --test client/src/views/tools-help-links.test.js`
+  - `node --test server/ai-help-auth.test.js`
+  - `node --test server/ai-help.test.js`
+  - `npm run build`（client）
+  - `.\build.ps1 -Phrase browsertoken`
+- 【验证】新构建版本：`2026.03.19-045508-browsertoken`
+- 【验证】已重新部署到 VH190（`192.168.0.190`）：
+  - `http://192.168.0.190:3000/api/version` 返回 `2026.03.19-045508-browsertoken`
+  - 登录后查得浏览器 `test` 的真实 token 是 `ZknLvnw5`
+  - `http://192.168.0.190:3000/api/ai/help/read-skills?token=ZknLvnw5&browserId=test` 已成功返回，并且正文中的 token 也显示为 `ZknLvnw5`
+- 【技能】远端部署继续复用 `C:\shared-browser\ai-deck\deploy-vh190\deploy-browsertoken.ps1`，日志持续追加在 `deploy-run.log`。
+- 2026-03-19 04:58 台北
+- 【注意】用户再次明确要求“并部署到 `192.168.0.190`”，因此本轮即使 VH190 已经是新功能，也重新执行了一次完整构建和覆盖部署。
+- 【验证】部署前远端版本是 `2026.03.19-045508-browsertoken`。
+- 【验证】重新执行本地验证：
+  - `node --test client/src/views/tools-help-links.test.js`
+  - `node --test server/ai-help-auth.test.js`
+  - `node --test server/ai-help.test.js`
+  - `.\build.ps1 -Phrase sync190`
+- 【验证】新构建版本：`2026.03.19-045733-sync190`
+- 【完成】重新部署到 VH190：
+  - 上传 `shared-browser.zip` 到 `C:\shared-browser\shared-browser.zip`
+  - 远端脚本：`C:\shared-browser\ai-deck\deploy-vh190\deploy-sync190.ps1`
+  - 远端日志：`C:\shared-browser\ai-deck\deploy-vh190\deploy-run.log`
+- 【验证】部署后远端返回：
+  - `/api/version` => `2026.03.19-045733-sync190`
+  - `/api/browsers/test/access-token` => 实际 token `ZknLvnw5`
+  - `/api/ai/help/read-skills?token=ZknLvnw5&browserId=test` => 正文头部已显示 `Token: ZknLvnw5`

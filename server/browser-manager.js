@@ -721,7 +721,23 @@ class BrowserManager {
           streamService.ensureWarmupSession(browserId, session.tabs[session.activeIndex].page);
           return session;
         } catch (e) {
-          // 活跃页面无效，移除它
+          const activeTab = session.tabs[session.activeIndex] || null;
+          const activePage = activeTab ? activeTab.page : null;
+          const discardActiveTab = this._shouldDiscardTabAfterProbeFailure(activePage, e);
+          logger.warn(browserId, 'Active page probe failed', {
+            userId,
+            discardActiveTab,
+            reason: e.message,
+            url: activeTab?.url || ''
+          });
+          if (!discardActiveTab && activePage) {
+            // A busy page (for example, a heavy localhost/WebGPU app) may miss the probe
+            // timeout without actually being dead. Keep the tab and let stream recovery continue.
+            this.touchBrowser(browserId);
+            streamService.ensureWarmupSession(browserId, activePage);
+            return session;
+          }
+          // 活跃页面已关闭/失效，移除它
           session.tabs.splice(session.activeIndex, 1);
           if (session.tabs.length > 0) {
             session.activeIndex = Math.min(session.activeIndex, session.tabs.length - 1);
@@ -879,6 +895,36 @@ class BrowserManager {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  _shouldDiscardTabAfterProbeFailure(page, error) {
+    try {
+      if (page && page.isClosed && page.isClosed()) return true;
+    } catch (_) {}
+
+    const message = String(error?.message || error || '').toLowerCase();
+    if (!message) return false;
+
+    if (
+      message.includes('target closed') ||
+      message.includes('session closed') ||
+      message.includes('browser has disconnected') ||
+      message.includes('not attached to an active page') ||
+      message.includes('no target with given id')
+    ) {
+      return true;
+    }
+
+    if (
+      message.includes('probe timeout after') ||
+      message.includes('execution context was destroyed') ||
+      message.includes('cannot find context with specified id') ||
+      message.includes('most likely because of a navigation')
+    ) {
+      return false;
+    }
+
+    return false;
   }
 
   // 向后兼容方法：获取用户的活跃页面

@@ -35,6 +35,8 @@ const videoRecordingService = require('./video-recording-service');
 const mcpLogger = require('./mcp-logger');
 const { TOOL_DEFINITIONS, normalizeToolAccess } = require('./browser-tools-registry');
 const { isUrlAllowedForUser } = require('./domain-policy');
+const { buildSkillsText: buildAiHelpText } = require('./ai-help');
+const { isAllowedAiHelpToken, resolveAiHelpDisplayToken } = require('./ai-help-auth');
 
 const app = express();
 const server = http.createServer(app);
@@ -765,7 +767,17 @@ function summarizeToolResponse(tool, data) {
       };
     case 'dev_console':
       return {
-        count: Array.isArray(data.entries) ? data.entries.length : 0
+        count: Array.isArray(data) ? data.length : (Array.isArray(data.entries) ? data.entries.length : 0),
+        errorCount: Array.isArray(data)
+          ? data.filter((item) => item && item.type === 'error').length
+          : 0
+      };
+    case 'devtools':
+      return {
+        action: data.action || 'snapshot',
+        consoleCount: Array.isArray(data.console?.entries) ? data.console.entries.length : 0,
+        networkCount: Array.isArray(data.network?.entries) ? data.network.entries.length : 0,
+        debuggerPaused: !!data.debugger?.paused
       };
     case 'navigate': {
       const tabs = Array.isArray(data.tabs) ? data.tabs : [];
@@ -911,6 +923,29 @@ function makeToolErrorResult(err, toolName) {
     ],
     structuredContent: payload
   };
+}
+
+function parseDevToolsArgs(input = {}, options = {}) {
+  const source = input && typeof input === 'object' ? input : {};
+  const limit = Number(source.limit);
+  const consoleLimit = Number(source.consoleLimit);
+  const networkLimit = Number(source.networkLimit);
+  const includeRaw = source.include;
+  const include = Array.isArray(includeRaw)
+    ? includeRaw.map((item) => String(item || '').trim()).filter(Boolean)
+    : typeof includeRaw === 'string'
+      ? includeRaw.split(',').map((item) => item.trim()).filter(Boolean)
+      : undefined;
+  const out = {
+    action: String(source.action || options.defaultAction || 'snapshot').trim() || 'snapshot'
+  };
+  if (Number.isFinite(limit) && limit > 0) out.limit = Math.floor(limit);
+  if (Number.isFinite(consoleLimit) && consoleLimit > 0) out.consoleLimit = Math.floor(consoleLimit);
+  if (Number.isFinite(networkLimit) && networkLimit > 0) out.networkLimit = Math.floor(networkLimit);
+  if (include && include.length > 0) out.include = include;
+  if (source.expression !== undefined) out.expression = String(source.expression || '');
+  if (source.callFrameId !== undefined) out.callFrameId = String(source.callFrameId || '');
+  return out;
 }
 
 function getMcpToolSchemas() {
@@ -1079,6 +1114,19 @@ function getMcpToolSchemas() {
       },
       additionalProperties: true
     },
+    devtools: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'DevTools action. Use snapshot, console.clear, network.clear, debugger.pause, debugger.resume, debugger.stepInto, debugger.stepOver, debugger.stepOut, or debugger.evaluate.' },
+        limit: { type: 'number', description: 'Alias of consoleLimit for snapshot calls.' },
+        consoleLimit: { type: 'number', description: 'Maximum console entries to include in snapshot responses.' },
+        networkLimit: { type: 'number', description: 'Maximum network request entries to include in snapshot responses.' },
+        include: { type: 'array', description: 'Optional snapshot sections to emphasize (advisory only).', items: { type: 'string' } },
+        expression: { type: 'string', description: 'Expression for debugger.evaluate when the debugger is paused.' },
+        callFrameId: { type: 'string', description: 'Optional paused call frame id for debugger.evaluate. Defaults to the top frame.' }
+      },
+      additionalProperties: true
+    },
     dev_eval: {
       type: 'object',
       properties: {
@@ -1137,6 +1185,7 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       try {
         const page = await browserManager.navigateCurrentTab(browserId, userId, url);
         if (!page) throw new Error('Failed to navigate current tab');
+        mcpService.ensureConsoleHook(browserId, page);
         return browserManager.getTabList(browserId, userId);
       } catch (e) {
         const tabs = browserManager.getTabList(browserId, userId);
@@ -1154,11 +1203,13 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       if (!Number.isFinite(tabIndex)) throw new Error('tabIndex is required');
       const page = await browserManager.switchTab(browserId, userId, tabIndex);
       if (!page) throw new Error(`Failed to switch tab: ${tabIndex}`);
+      mcpService.ensureConsoleHook(browserId, page);
       return browserManager.getTabList(browserId, userId);
     }
     case 'tabs_new': {
       const page = await browserManager.createNewTab(browserId, userId, args?.url);
       if (!page) throw new Error('Failed to create new tab');
+      mcpService.ensureConsoleHook(browserId, page);
       return browserManager.getTabList(browserId, userId);
     }
     case 'tabs_close': {
@@ -1180,7 +1231,10 @@ async function executeMcpToolCall(browserId, userId, toolName, args = {}) {
       return await mcpService.getHtml(browserId, userId);
     case 'dev_console': {
       const limit = Number(args?.limit || 200);
-      return mcpService.getConsole(browserId, limit);
+      return await mcpService.getConsole(browserId, limit, userId);
+    }
+    case 'devtools': {
+      return await mcpService.getDevTools(browserId, parseDevToolsArgs(args || {}), userId);
     }
     case 'dev_eval': {
       const script = String(args?.script || '');
@@ -1768,6 +1822,44 @@ app.get(`${config.mcp.routePrefix}/:browserId/dev/console`, authMiddleware, asyn
   }
 });
 
+app.get(`${config.mcp.routePrefix}/:browserId/devtools`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'devtools');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'devtools')) return;
+
+    const data = await executeMcpToolCall(browserId, req.user.id, 'devtools', parseDevToolsArgs(req.query, { defaultAction: 'snapshot' }));
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post(`${config.mcp.routePrefix}/:browserId/devtools`, authMiddleware, async (req, res) => {
+  const browserId = req.params.browserId;
+  const callCtx = logToolCallStart(req, browserId, 'devtools');
+  try {
+    if (!ensureMcpAvailable(res)) return;
+    const browser = browserApi.getById(browserId);
+    if (!browser) return res.status(404).json({ error: 'Browser not found' });
+    if (!ensureBrowserApiModeEnabled(res, browser)) return;
+    if (!ensureToolEnabled(res, browser, 'devtools')) return;
+
+    const data = await executeMcpToolCall(browserId, req.user.id, 'devtools', parseDevToolsArgs(req.body, { defaultAction: 'snapshot' }));
+    logToolCallOk(callCtx, data);
+    res.json(data);
+  } catch (e) {
+    logToolCallError(callCtx, e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
 app.post(`${config.mcp.routePrefix}/:browserId/dev/eval`, authMiddleware, async (req, res) => {
   const browserId = req.params.browserId;
   const callCtx = logToolCallStart(req, browserId, 'dev_eval');
@@ -1934,6 +2026,502 @@ app.post('/api/files/:browserId/cancel/:guid', authMiddleware, async (req, res) 
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// ============== AI Help API ==============
+
+function aiTokenMiddleware(req, res, next) {
+  const token = req.query.token ||
+    (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')
+      ? req.headers.authorization.slice(7)
+      : null);
+  const browserId = String(req.query.browserId || '').trim();
+  let browserToken = '';
+  if (browserId) {
+    try {
+      browserToken = browserApi.getAccessToken(browserId)?.apiToken || '';
+    } catch (_) {}
+  }
+  if (!config.aiToken && !browserToken) {
+    return res.status(503).json({ error: 'AI token not configured (set aiToken in params.json)' });
+  }
+  if (!isAllowedAiHelpToken({
+    providedToken: token,
+    aiToken: config.aiToken,
+    browserToken
+  })) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+  req.aiHelpToken = resolveAiHelpDisplayToken({
+    providedToken: token,
+    browserToken,
+    aiToken: config.aiToken
+  });
+  next();
+}
+
+function buildSkillsText(base, token) {
+  return `# Shared Browser API Skills
+
+Read-skills URL: ${base}/api/ai/help/read-skills?token=${token}
+
+============================================================
+== Authentication
+============================================================
+All endpoints accept token via:
+  - Query param:  ?token=${token}
+  - HTTP header:  Authorization: Bearer ${token}
+
+Replace "MYBROWSER" in examples below with a real browser ID.
+Discover browser IDs: GET ${base}/api/browsers?token=${token}
+
+============================================================
+== 1. Utility
+============================================================
+
+### version — Server version
+GET ${base}/api/version
+No auth required. No parameters.
+Returns:
+  version    string  Version string
+  buildTime  string  ISO build timestamp
+  phrase     string  Build mnemonic
+
+curl:
+  curl "${base}/api/version"
+
+------------------------------------------------------------
+### browsers — List available browsers
+GET ${base}/api/browsers?token=${token}
+No parameters.
+Returns array of objects:
+  id             string   Browser identifier (use as :bid below)
+  name           string   Display name
+  mcpEnabled     boolean  MCP JSON-RPC enabled
+  webApiEnabled  boolean  WebAPI tool endpoints enabled
+  hasApiToken    boolean  Per-browser API token configured
+  toolAccess     object   Per-tool access control map
+
+curl:
+  curl "${base}/api/browsers?token=${token}"
+
+============================================================
+== 2. Browser Tool Endpoints
+============================================================
+Route pattern: ${base}/api/mcp/:bid/<tool>?token=${token}
+Replace :bid with a real browser ID.
+
+------------------------------------------------------------
+### screenshot — Capture browser viewport
+POST ${base}/api/mcp/:bid/screenshot?token=${token}
+Content-Type: application/json
+
+Request body (all optional):
+  fullPage       boolean  Capture full scrollable page height. Default: false.
+  useLiveFrame   boolean  Use latest cached stream frame when available. Default: false.
+
+Returns:
+  fileId         string   Internal unique file identifier
+  filename       string   Screenshot filename (e.g. "shot-1710000000000.jpg")
+  mimeType       string   MIME type (e.g. "image/jpeg")
+  size           number   File size in bytes
+  resourceUrl    string   GET URL to download image binary (~15 min validity)
+  resourceToken  string   Short-lived HMAC token embedded in resourceUrl
+  url            string   Current page URL at time of capture
+  title          string   Current page title
+  dialogs        array    Active dialogs [{type: string, message: string}]
+  source         string   Frame source ("live" | "stream")
+
+To download binary image (application/octet-stream):
+  curl -L "<resourceUrl>" -o screenshot.jpg
+
+Note: Only latest 10 screenshots per browser are kept.
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/screenshot?token=${token}" \\
+    -H "Content-Type: application/json" -d "{}"
+
+------------------------------------------------------------
+### pointer — Mouse move / click / drag / scroll
+POST ${base}/api/mcp/:bid/pointer?token=${token}
+Content-Type: application/json
+
+Request body (provide coordinates or selectors):
+  start          object   {x: number, y: number} viewport start position
+  end            object   {x: number, y: number} viewport end/destination position
+  startSelector  string   CSS selector to resolve start point center
+  endSelector    string   CSS selector to resolve end point center
+  button         string   "left" | "right" | "middle". Default: "left"
+  clickAtEnd     boolean  Click at end position. Default: false
+  clickCount     number   Click count when clickAtEnd=true. Default: 1
+  pressAtStart   boolean  Press mouse button down at start. Default: false
+  releaseAtEnd   boolean  Release mouse button at end. Default: false
+  wheelDeltaX    number   Horizontal wheel scroll delta
+  wheelDeltaY    number   Vertical wheel scroll delta
+  steps          number   Interpolation steps for smooth move. Default: 1
+
+Returns:
+  ok      boolean  Action completed
+  end     object   Final {x, y} position
+  button  string   Button used
+
+curl (click at x=500, y=300):
+  curl -X POST "${base}/api/mcp/MYBROWSER/pointer?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"end":{"x":500,"y":300},"clickAtEnd":true}'
+
+------------------------------------------------------------
+### keyboard — Type text / press keys / shortcuts
+POST ${base}/api/mcp/:bid/keyboard?token=${token}
+Content-Type: application/json
+
+Request body (use one mode per call):
+  text        string   Text to type character by character
+  selector    string   CSS selector to focus before any keyboard action
+  clearBefore boolean  Clear target element before typing. Default: false
+  delayMs     number   Delay between keystrokes in ms. Default: 0
+  pressEnter  boolean  Press Enter after typing. Default: false
+  key         string   Single key name. Aliases: "pgup", "pgdn", "esc", "tab", "enter", "backspace", etc.
+  shortcut    string   Alias of key
+  shortcuts   array    string[] — sequence of keys to press in order
+  keys        array    string[] — key combo to press simultaneously (e.g. ["Control","a"])
+  combo       array    string[] — alias of keys
+  repeat      number   Repeat count for single key. Default: 1
+
+Returns:
+  ok    boolean  Action completed
+  mode  string   "text" | "key" | "combo" | "sequence"
+
+curl (type text then Enter):
+  curl -X POST "${base}/api/mcp/MYBROWSER/keyboard?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"text":"hello world","pressEnter":true}'
+
+------------------------------------------------------------
+### paste — Paste large text or HTML into focused element
+POST ${base}/api/mcp/:bid/paste?token=${token}
+Content-Type: application/json
+
+Request body:
+  text      string  (required) Plain text content to paste
+  html      string  Optional HTML version for rich clipboard content
+  selector  string  CSS selector to focus before paste
+
+Returns:
+  ok               boolean  Paste completed
+  mode             string   "text" | "html"
+  pastedTextLength number   Character count of pasted text
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/paste?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"text":"Lorem ipsum dolor sit amet, consectetur adipiscing elit."}'
+
+------------------------------------------------------------
+### pasteFiles — Paste files into file input or drop target
+POST ${base}/api/mcp/:bid/pasteFiles?token=${token}
+Content-Type: multipart/form-data
+
+Form fields:
+  selector  string  (optional) CSS selector for the file input or drop target
+  files     file[]  (required) One or more files — use -F "files=@/path/to/file"
+
+Returns:
+  ok         boolean  Paste completed
+  mode       string   "files"
+  fileCount  number   Number of files pasted
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/pasteFiles?token=${token}" \\
+    -F "selector=#upload-input" \\
+    -F "files=@/tmp/document.pdf"
+
+------------------------------------------------------------
+### clipboard/view — Read browser virtual clipboard
+GET ${base}/api/mcp/:bid/clipboard/view?token=${token}
+
+Query params (optional):
+  captureSelection  string  Set to "true" to capture current page selection first
+
+Returns:
+  text       string   Clipboard plain text content
+  html       string   Clipboard HTML content (empty string if none)
+  textLength number   Character count of text
+  hasHtml    boolean  Whether HTML content is present
+  hasFiles   boolean  Whether files are in clipboard
+  source     string   Content origin: "tool" | "session" | "browser" | "empty"
+  updatedAt  string   ISO timestamp of last update (null if never set)
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/clipboard/view?token=${token}"
+
+------------------------------------------------------------
+### tablist — List all open tabs
+GET ${base}/api/mcp/:bid/tablist?token=${token}
+No parameters.
+
+Returns:
+  tabs         array   List of tab objects:
+    index      number  Zero-based tab position
+    url        string  Current page URL
+    title      string  Page title
+    isActive   boolean Whether this is the focused tab
+    targetId   string  Chrome DevTools target ID
+  activeIndex  number  Index of the currently active tab
+  tabCount     number  Total number of open tabs
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/tablist?token=${token}"
+
+------------------------------------------------------------
+### navigate — Navigate current tab to URL
+POST ${base}/api/mcp/:bid/navigate?token=${token}
+Content-Type: application/json
+
+Request body:
+  url  string  (required) Full URL to navigate to (must include protocol, e.g. "https://...")
+
+Returns (same shape as tablist):
+  tabs             array   Updated tab list after navigation
+  activeIndex      number  Current active tab index
+  navigationError  string  Error message if blocked by domain policy; null otherwise
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/navigate?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"url":"https://www.example.com"}'
+
+------------------------------------------------------------
+### tabs/select — Switch active tab
+POST ${base}/api/mcp/:bid/tabs/select?token=${token}
+Content-Type: application/json
+
+Request body:
+  tabIndex  number  (required) Zero-based index of tab to activate
+
+Returns (same shape as tablist):
+  tabs        array   Updated tab list
+  activeIndex number  Newly activated tab index
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/tabs/select?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"tabIndex":1}'
+
+------------------------------------------------------------
+### tabs/new — Open a new tab
+POST ${base}/api/mcp/:bid/tabs/new?token=${token}
+Content-Type: application/json
+
+Request body:
+  url  string  (optional) Initial URL. Omit to use browser default page.
+
+Returns (same shape as tablist):
+  tabs        array   Updated tab list including new tab
+  activeIndex number  Index of newly created tab
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/tabs/new?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"url":"https://www.google.com"}'
+
+------------------------------------------------------------
+### tabs/close — Close a tab by index
+POST ${base}/api/mcp/:bid/tabs/close?token=${token}
+Content-Type: application/json
+
+Request body:
+  tabIndex  number  (required) Zero-based index of tab to close.
+                    Closing the last tab navigates to the browser default URL.
+
+Returns (same shape as tablist):
+  tabs        array   Updated tab list after close
+  activeIndex number  Current active tab index
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/tabs/close?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"tabIndex":2}'
+
+------------------------------------------------------------
+### video/start — Record browser screen to MP4 (blocking)
+POST ${base}/api/mcp/:bid/video/start?token=${token}
+Content-Type: application/json
+
+Request body:
+  durationSec  number  (required) Duration in seconds. Maximum 15 (admin-configurable).
+
+Blocking: returns only after MP4 is fully encoded and written to disk.
+
+Returns:
+  fileId       string  Internal file identifier
+  filename     string  MP4 filename
+  durationSec  number  Actual recorded duration
+  size         number  File size in bytes
+  resourceUrl  string  GET URL to download the MP4 (~15 min validity)
+
+To download MP4 (application/octet-stream):
+  curl -L "<resourceUrl>" -o recording.mp4
+
+Note: Latest 10 recordings per browser kept. Older files auto-pruned.
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/video/start?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"durationSec":8}'
+
+------------------------------------------------------------
+### video/list — List recorded MP4 files
+GET ${base}/api/mcp/:bid/video/list?token=${token}
+No parameters.
+
+Returns array of recording objects:
+  fileId        string  Internal identifier
+  filename      string  MP4 filename
+  durationSec   number  Duration in seconds
+  size          number  File size in bytes
+  createdAt     string  ISO creation timestamp
+  resourceUrl   string  GET URL to download (~15 min validity)
+  resourceToken string  Short-lived HMAC token embedded in resourceUrl
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/video/list?token=${token}"
+
+------------------------------------------------------------
+### downloads — List browser-initiated file downloads
+GET ${base}/api/mcp/:bid/downloads?token=${token}
+No parameters.
+
+Returns:
+  files   array   Completed downloads:
+    name          string  Filename
+    size          number  File size in bytes
+    mimeType      string  Detected MIME type
+    downloadedAt  string  ISO completion timestamp
+    resourceUrl   string  GET URL to download file (~15 min validity)
+  active  array   In-progress downloads:
+    filename    string  Filename
+    guid        string  Browser download GUID
+    state       string  "in_progress"
+    resourceUrl string  GET URL (available when complete)
+
+To download a completed file (application/octet-stream):
+  curl -L "<resourceUrl>" -o output.bin
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/downloads?token=${token}"
+
+------------------------------------------------------------
+### dev/html — Read current page HTML source
+GET ${base}/api/mcp/:bid/dev/html?token=${token}
+No parameters.
+
+Returns:
+  url         string  Current page URL
+  title       string  Current page title
+  html        string  Full outer HTML of the page
+  htmlLength  number  HTML character count
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/dev/html?token=${token}"
+
+------------------------------------------------------------
+### dev/console — Read captured JS console output
+GET ${base}/api/mcp/:bid/dev/console?token=${token}
+
+Query params:
+  limit  number  Max entries to return. Default: 200.
+
+Returns:
+  entries  array  Console log entries:
+    timestamp  string  ISO timestamp
+    type       string  "log" | "warn" | "error" | "info" | "debug"
+    text       string  Console message text
+
+curl:
+  curl "${base}/api/mcp/MYBROWSER/dev/console?token=${token}&limit=50"
+
+------------------------------------------------------------
+### dev/eval — Execute JavaScript in page context
+POST ${base}/api/mcp/:bid/dev/eval?token=${token}
+Content-Type: application/json
+
+Request body:
+  script  string  (required) JavaScript expression or statement to execute in page context
+
+Returns:
+  result  any     Serialized return value of the expression
+  error   string  Error message if execution threw (field absent on success)
+
+curl:
+  curl -X POST "${base}/api/mcp/MYBROWSER/dev/eval?token=${token}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"script":"document.title"}'
+
+============================================================
+== 3. Binary Resource Download
+============================================================
+
+### dl_res — Download binary by resource URL
+GET ${base}/api/mcp/:bid/dl_res?token=<resourceToken>&kind=<kind>&...
+
+resourceUrl is embedded in responses from: screenshot, video/list, downloads.
+Use the full resourceUrl as-is — do not construct manually.
+
+Embedded parameters (all present in resourceUrl):
+  token     string  (required) Short-lived HMAC resource token (~15 min validity)
+  kind      string  "screenshot" | "video" | "download"
+  fileId    string  File ID (for screenshot and video kinds)
+  filename  string  Filename (for download kind)
+  userId    string  Owner user ID (for download kind)
+
+Response: application/octet-stream binary stream
+  Content-Disposition: attachment; filename="<filename>"
+  Content-Length: <size in bytes>
+
+curl:
+  curl -L "<resourceUrl>" -o output.bin
+
+============================================================
+== Quick Reference (all URLs with token)
+============================================================
+
+  Read skills:      GET  ${base}/api/ai/help/read-skills?token=${token}
+  Server version:   GET  ${base}/api/version
+  List browsers:    GET  ${base}/api/browsers?token=${token}
+  Screenshot:       POST ${base}/api/mcp/MYBROWSER/screenshot?token=${token}
+  Pointer:          POST ${base}/api/mcp/MYBROWSER/pointer?token=${token}
+  Keyboard:         POST ${base}/api/mcp/MYBROWSER/keyboard?token=${token}
+  Paste text:       POST ${base}/api/mcp/MYBROWSER/paste?token=${token}
+  Paste files:      POST ${base}/api/mcp/MYBROWSER/pasteFiles?token=${token}
+  View clipboard:   GET  ${base}/api/mcp/MYBROWSER/clipboard/view?token=${token}
+  Tab list:         GET  ${base}/api/mcp/MYBROWSER/tablist?token=${token}
+  Navigate:         POST ${base}/api/mcp/MYBROWSER/navigate?token=${token}
+  Tab select:       POST ${base}/api/mcp/MYBROWSER/tabs/select?token=${token}
+  Tab new:          POST ${base}/api/mcp/MYBROWSER/tabs/new?token=${token}
+  Tab close:        POST ${base}/api/mcp/MYBROWSER/tabs/close?token=${token}
+  Record video:     POST ${base}/api/mcp/MYBROWSER/video/start?token=${token}
+  List videos:      GET  ${base}/api/mcp/MYBROWSER/video/list?token=${token}
+  Downloads:        GET  ${base}/api/mcp/MYBROWSER/downloads?token=${token}
+  HTML source:      GET  ${base}/api/mcp/MYBROWSER/dev/html?token=${token}
+  Console log:      GET  ${base}/api/mcp/MYBROWSER/dev/console?token=${token}
+  Eval JS:          POST ${base}/api/mcp/MYBROWSER/dev/eval?token=${token}
+`.trim();
+}
+
+app.get('/api/ai/help/read-skills', aiTokenMiddleware, (req, res) => {
+  const base = `${req.protocol}://${req.get('host')}`;
+  const browserId = String(req.query.browserId || '').trim();
+  const text = buildAiHelpText(base, String(req.aiHelpToken || config.aiToken || ''), browserId);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(text);
+});
+
+// Public endpoint: returns the pre-filled skills URL (exposes no secret beyond what read-skills already embeds)
+app.get('/api/ai/help/skills-url', (req, res) => {
+  if (!config.aiToken) return res.status(503).json({ error: 'AI token not configured' });
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({ url: `${base}/api/ai/help/read-skills?token=${config.aiToken}` });
 });
 
 // ============== WebSocket 连接处理 ==============
@@ -2804,6 +3392,7 @@ server.listen(config.port, config.host, () => {
   console.log(`[Server] Data directory: ${config.dataDir}`);
   console.log(`[Server] Profile directory: ${config.profilesDir}`);
   console.log(`[Server] Auto-restart: ${config.autoRestart.enabled ? 'enabled' : 'disabled'}`);
+  console.log(`[Server] WebGPU secure origins: ${(config.puppeteer.webgpuSecureOrigins || []).join(', ') || '(none)'}`);
 
   // 启动浏览器健康检查
   browserManager.startHealthCheck();

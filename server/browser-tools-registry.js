@@ -42,13 +42,6 @@ const TOOL_DEFINITIONS = [
     apiMethod: 'GET'
   },
   {
-    id: 'tabs_list',
-    name: 'Tabs List',
-    description: 'List tabs and current active tab index',
-    mcpPath: 'tabs',
-    apiMethod: 'GET'
-  },
-  {
     id: 'tablist',
     name: 'Tab List',
     description: 'List all tabs with url/title and indicate current active tab',
@@ -121,9 +114,16 @@ const TOOL_DEFINITIONS = [
   {
     id: 'dev_console',
     name: 'Dev Console',
-    description: 'Read captured console output',
+    description: 'Read captured DevTools console output, including runtime errors and stack traces',
     mcpPath: 'dev/console',
     apiMethod: 'GET'
+  },
+  {
+    id: 'devtools',
+    name: 'DevTools',
+    description: 'Inspect console/runtime/network/debugger state and issue debugger actions',
+    mcpPath: 'devtools',
+    apiMethod: 'POST'
   },
   {
     id: 'dev_eval',

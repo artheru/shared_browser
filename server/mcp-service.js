@@ -4,6 +4,7 @@ const browserManager = require('./browser-manager');
 const config = require('./config');
 const fileService = require('./file-service');
 const streamService = require('./stream-service');
+const DevToolsService = require('./devtools-service');
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
@@ -13,8 +14,7 @@ function ensureDir(dir) {
 
 class McpService {
   constructor() {
-    this.consoleBuffer = new Map(); // browserId -> [{timestamp,type,text}]
-    this.maxConsoleEntries = 500;
+    this.devtools = new DevToolsService();
     this.clipboardStore = new Map(); // `${browserId}_${userId}` -> { text, html, files, updatedAt, source }
     this.screenshotRootDir = path.join(config.uploadsDir, 'mcp-screenshots');
     this.screenshotStore = new Map(); // browserId -> [{ fileId, path, mimeType, size, createdAt }]
@@ -303,26 +303,7 @@ class McpService {
   }
 
   ensureConsoleHook(browserId, page) {
-    if (page.__mcpConsoleHooked) return;
-    page.__mcpConsoleHooked = true;
-    page.on('console', (msg) => {
-      const existing = this.consoleBuffer.get(browserId) || [];
-      existing.push({
-        timestamp: new Date().toISOString(),
-        type: msg.type(),
-        text: msg.text()
-      });
-      if (existing.length > this.maxConsoleEntries) {
-        existing.splice(0, existing.length - this.maxConsoleEntries);
-      }
-      this.consoleBuffer.set(browserId, existing);
-    });
-    page.on('close', () => {
-      // Clear per-page hook marker to avoid retaining stale state on reused objects.
-      try {
-        page.__mcpConsoleHooked = false;
-      } catch (_) {}
-    });
+    this.devtools.ensurePageSession(browserId, page).catch(() => {});
   }
 
   _detectImageFormat(buffer) {
@@ -912,13 +893,18 @@ class McpService {
     };
   }
 
-  getConsole(browserId, limit = 200) {
-    const list = this.consoleBuffer.get(browserId) || [];
-    return list.slice(-limit).reverse();
+  async getConsole(browserId, limit = 200, userId = 'api') {
+    const page = await this.getPage(browserId, userId);
+    return this.devtools.getConsole(browserId, page, { limit });
   }
 
   clearConsoleBuffer(browserId) {
-    this.consoleBuffer.delete(browserId);
+    this.devtools.clearBrowser(browserId);
+  }
+
+  async getDevTools(browserId, args = {}, userId = 'api') {
+    const page = await this.getPage(browserId, userId);
+    return this.devtools.execute(browserId, page, args || {});
   }
 
   async evalJs(browserId, script, userId = 'api') {

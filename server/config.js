@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 function readParamsFile() {
   const candidates = [
@@ -20,8 +21,77 @@ function readParamsFile() {
   return {};
 }
 
+function parseStringList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function parsePortList(value, fallback = []) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of parseStringList(value)) {
+    const port = Number(raw);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+    if (seen.has(port)) continue;
+    seen.add(port);
+    out.push(port);
+  }
+  if (out.length > 0) return out;
+  return fallback;
+}
+
+function getLocalIpv4Addresses() {
+  const out = [];
+  const seen = new Set();
+  const interfaces = os.networkInterfaces();
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (!entry || entry.family !== 'IPv4' || entry.internal) continue;
+      const address = String(entry.address || '').trim();
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      out.push(address);
+    }
+  }
+  return out;
+}
+
+function getWebGpuSecureOrigins(params) {
+  const explicitOrigins = parseStringList(
+    process.env.UNSAFE_WEBGPU_SECURE_ORIGINS ||
+    params.puppeteer?.webgpuSecureOrigins ||
+    params.puppeteer?.secureOrigins
+  );
+  const securePorts = parsePortList(
+    process.env.UNSAFE_WEBGPU_SECURE_PORTS ||
+    params.puppeteer?.webgpuSecurePorts ||
+    params.puppeteer?.securePorts,
+    [8081]
+  );
+
+  const origins = new Set(explicitOrigins);
+  const localHosts = ['localhost', '127.0.0.1', ...getLocalIpv4Addresses()];
+  for (const port of securePorts) {
+    for (const host of localHosts) {
+      origins.add(`http://${host}:${port}`);
+    }
+  }
+  return Array.from(origins);
+}
+
 const params = readParamsFile();
 const gpuEnabled = params.puppeteer?.enableGpu !== false;
+const webgpuSecureOrigins = getWebGpuSecureOrigins(params);
 
 const puppeteerArgs = [
   '--no-sandbox',
@@ -54,6 +124,12 @@ if (gpuEnabled) {
     '--ignore-gpu-blocklist',
     '--force_high_performance_gpu'
   );
+  if (webgpuSecureOrigins.length > 0) {
+    puppeteerArgs.push(
+      '--enable-unsafe-webgpu',
+      `--unsafely-treat-insecure-origin-as-secure=${webgpuSecureOrigins.join(',')}`
+    );
+  }
   if (process.platform === 'win32') {
     puppeteerArgs.push('--use-angle=d3d11');
   }
@@ -108,6 +184,7 @@ module.exports = {
           : '/usr/bin/google-chrome'),
     args: puppeteerArgs,
     enableGpu: gpuEnabled,
+    webgpuSecureOrigins,
     // 真实浏览器 User-Agent（匹配近期 Chrome 版本，避免被标记为过时浏览器）
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
   },
@@ -155,5 +232,8 @@ module.exports = {
   logging: {
     maxFileBytes: Number(params.logging?.maxFileBytes || 5 * 1024 * 1024),
     maxFiles: Number(params.logging?.maxFiles || 5)
-  }
+  },
+
+  // AI 静态 token（用于 /api/ai/* 端点，配置在 params.json 的 aiToken 字段）
+  aiToken: params.aiToken || null
 };

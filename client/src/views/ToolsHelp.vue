@@ -10,35 +10,6 @@
     </header>
 
     <div class="container">
-      <div class="card">
-        <p class="desc">{{ t('toolsHelp.description') }}</p>
-        <h3>{{ t('toolsHelp.quickHelpTitle') }}</h3>
-        <p class="desc">{{ t('toolsHelp.quickHelpText') }}</p>
-        <div class="hint">
-          {{ t('toolsHelp.fullApiHint') }}
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>{{ t('toolsHelp.colId') }}</th>
-              <th>{{ t('toolsHelp.colName') }}</th>
-              <th>{{ t('toolsHelp.colMethod') }}</th>
-              <th>{{ t('toolsHelp.colPath') }}</th>
-              <th>{{ t('toolsHelp.colDescription') }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="tool in tools" :key="tool.id">
-              <td><code>{{ tool.id }}</code></td>
-              <td>{{ tool.name }}</td>
-              <td>{{ tool.apiMethod }}</td>
-              <td><code>{{ fullMcpBaseUrl }}/{{ tool.mcpPath }}</code></td>
-              <td>{{ tool.description }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
       <div class="card ai-guide-card">
         <h3>{{ t('toolsHelp.aiGuideTitle') }}</h3>
         <p class="desc">{{ t('toolsHelp.aiGuideDesc') }}</p>
@@ -93,21 +64,13 @@
           </label>
         </div>
 
-        <div class="actions">
-          <button class="btn btn-primary btn-sm" @click="generateGuide">
-            {{ t('toolsHelp.generateGuide') }}
-          </button>
-          <button class="btn btn-secondary btn-sm" :disabled="!guideMarkdown" @click="copyGuide">
-            {{ t('toolsHelp.copyGuide') }}
-          </button>
-          <button class="btn btn-secondary btn-sm" :disabled="!guideMarkdown" @click="downloadGuide">
-            {{ t('toolsHelp.downloadGuide') }}
-          </button>
+        <div v-if="selectedHelpType === 'api' && guideForm.token" class="skills-url-box">
+          <strong>Read Full API Skills:</strong>
+          <div class="skills-url-row">
+            <a :href="readSkillsUrl" target="_blank" rel="noopener" class="skills-url-link">{{ readSkillsUrl }}</a>
+            <button class="btn btn-secondary btn-sm" @click="copyText(readSkillsUrl)">Copy</button>
+          </div>
         </div>
-
-        <h4>{{ t('toolsHelp.guidePreview') }}</h4>
-        <pre v-if="guideMarkdown" class="guide-preview">{{ guideMarkdown }}</pre>
-        <div v-else class="hint">{{ t('toolsHelp.noGuideYet') }}</div>
       </div>
 
       <!-- New token modal -->
@@ -134,6 +97,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '../utils/api'
 import { useI18n } from '../i18n'
+import { buildReadSkillsUrl } from './tools-help-links'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -158,6 +122,12 @@ const currentBrowserId = computed(() => (guideForm.value.browserId || 'test').tr
 
 const fullMcpBaseUrl = computed(() => `${normalizedBaseUrl.value}${routePrefix.value}/${currentBrowserId.value}`)
 
+const readSkillsUrl = computed(() => buildReadSkillsUrl({
+  baseUrl: normalizedBaseUrl.value,
+  browserId: currentBrowserId.value,
+  token: guideForm.value.token
+}))
+
 const mcpServerJsonText = computed(() => JSON.stringify({
   mcpServers: {
     [`shared-browser-${currentBrowserId.value}`]: {
@@ -169,157 +139,158 @@ const mcpServerJsonText = computed(() => JSON.stringify({
   }
 }, null, 2))
 
-function formatToolsForMarkdown() {
-  if (!tools.value.length) return '- (no tools loaded)\n'
-  return tools.value.map((tool) => {
-    const path = `${fullMcpBaseUrl.value}/${tool.mcpPath}`
-    return `- \`${tool.id}\`: \`${tool.apiMethod}\` \`${path}\` - ${tool.description}`
-  }).join('\n')
-}
-
 function buildGuideMarkdown() {
-  const base = guideForm.value.serverBaseUrl || window.location.origin
-  const browserId = guideForm.value.browserId || 'test'
-  const token = guideForm.value.token || '<paste-token-here>'
+  const base = normalizedBaseUrl.value
+  const browserId = currentBrowserId.value
+  const token = guideForm.value.token || 'TOKEN'
+  const mcpBase = fullMcpBaseUrl.value
+  const skillsUrl = readSkillsUrl.value
   const isMcpHelp = selectedHelpType.value === 'mcp'
-  const guideTitle = isMcpHelp ? 'MCP Help Guide' : 'API Help Guide'
-  const modeLabel = isMcpHelp ? 'mcp' : 'api'
-  const modeIntro = isMcpHelp
-    ? 'Use this guide when configuring AI clients through MCP server JSON.'
-    : 'Use this guide when calling HTTP API endpoints directly.'
-  const authSection = isMcpHelp
-    ? `## MCP Server JSON
+
+  if (isMcpHelp) {
+    return `# Shared Browser MCP Help Guide
+
+## Connection
+- MCP Base URL: \`${mcpBase}\`
+- Browser ID: \`${browserId}\`
+
+## MCP Server JSON
 \`\`\`json
 ${mcpServerJsonText.value}
 \`\`\`
+
+## AI Action Loop
+1. screenshot → observe current state
+2. dev/html or dev/eval → locate element
+3. pointer or keyboard → act
+4. screenshot → verify
 `
-    : `## HTTP Auth Header
-Use this header in all API requests:
-\`\`\`
-Authorization: Bearer ${token}
-\`\`\`
-`
+  }
 
-  return `# Shared Browser ${guideTitle}
+  // API help guide
+  return `# Shared Browser API Help Guide
 
-## Server Context
-- Base URL: \`${base}\`
-- Browser ID: \`${browserId}\`
-- Token: \`${token}\`
-- Help Mode: \`${modeLabel}\`
+Full skills reference: ${skillsUrl}
 
-${modeIntro}
+## Connection
+- Base URL: \`${base}\`  Browser ID: \`${browserId}\`  Token: \`${token}\`
+- Auth: append \`?token=${token}\` to every request
 
-## Login (Optional)
-If you already have a JWT token (e.g. from the web UI login), you can skip this step.
+## AI Action Loop
+1. screenshot → observe state
+2. dev/html or dev/eval → locate element
+3. pointer or keyboard → act
+4. screenshot → verify
+
+---
+
+## screenshot — Capture viewport
+POST ${mcpBase}/screenshot?token=${token}
+Params: none
+Returns: resourceUrl (string, fetch as application/octet-stream), width (number), height (number)
+
 \`\`\`bash
-curl -s -X POST "${base}/api/auth/login" \\
-  -H "Content-Type: application/json" \\
-  -d '{"username":"<username>","password":"<password>"}'
+curl -s -X POST "${mcpBase}/screenshot?token=${token}" -H "Content-Type: application/json" -d '{}'
+# Fetch image: curl -L "<resourceUrl>" -o screenshot.jpg
 \`\`\`
 
-## List Browsers
-\`\`\`bash
-curl -s "${base}/api/browsers" \\
-  -H "Authorization: Bearer ${token}"
-\`\`\`
+---
 
-${authSection}
+## pointer — Mouse click or drag
+POST ${mcpBase}/pointer?token=${token}
+  startSelector  string   optional*  CSS selector for start
+  startX/startY  number   optional*  coordinates (if no selector)
+  endSelector    string   optional   drag end selector
+  endX/endY      number   optional   drag end coordinates
+  clickAtEnd     boolean  optional   click at end (default: true)
+  button         string   optional   "left"|"right"|"middle" (default: "left")
+  dblclick       boolean  optional   double-click (default: false)
+  * one of startSelector or startX+startY required
+Returns: ok (boolean)
 
-## AI Operation Manual
-1. Always call \`screenshot\` before action.
-2. Use \`dev/html\` or \`dev/eval\` to locate the target.
-3. Send exactly one \`pointer\` or \`keyboard\` action.
-4. Wait 200ms-1500ms.
-5. Call \`screenshot\` again to verify.
-6. On failure, retry with updated selector/coordinates.
-7. For recordings, call \`start_video_recording\` and wait for returned \`fileId\` before any follow-up API.
+## keyboard — Type or shortcut
+POST ${mcpBase}/keyboard?token=${token}
+  selector    string   optional*  CSS selector to focus
+  text        string   optional*  text to type
+  clearBefore boolean  optional   clear before typing (default: false)
+  pressEnter  boolean  optional   press Enter after (default: false)
+  shortcut    string   optional*  e.g. "ctrl+a", "pgdn", "escape"
+  * one of text or shortcut required
+Returns: ok (boolean)
 
-## API Examples (Full URL)
-### Screenshot
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/screenshot" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{}'
-\`\`\`
+## paste — Paste large text
+POST ${mcpBase}/paste?token=${token}
+  text      string  required  content to paste
+  selector  string  optional  CSS selector to focus first
+Returns: ok (boolean)
 
-### Click by selector
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/pointer" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"startSelector":"button[type=\\"submit\\"]","endSelector":"button[type=\\"submit\\"]","clickAtEnd":true,"button":"left"}'
-\`\`\`
+## navigate — Navigate to URL
+POST ${mcpBase}/navigate?token=${token}
+  url        string  required  target URL (include protocol)
+  waitUntil  string  optional  "load"|"domcontentloaded"|"networkidle0" (default: "load")
+Returns: ok (boolean), url (string)
 
-### Keyboard text input
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/keyboard" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"selector":"input[name=\\"q\\"]","clearBefore":true,"text":"hello","pressEnter":true}'
-\`\`\`
+## tablist — List open tabs
+GET ${mcpBase}/tablist?token=${token}
+Returns: tabs (array of {id, url, title, active})
 
-### Keyboard shortcut (PageDown)
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/keyboard" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"shortcut":"pgdn"}'
-\`\`\`
+## tabs/select — Switch active tab
+POST ${mcpBase}/tabs/select?token=${token}
+  tabId  string  required  tab ID from tablist
+Returns: ok (boolean)
 
-### Eval page state
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/dev/eval" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"script":"({url: location.href, title: document.title})"}'
-\`\`\`
+## tabs/new — Open new tab
+POST ${mcpBase}/tabs/new?token=${token}
+  url  string  optional  initial URL
+Returns: ok (boolean), tabId (string)
 
-## Video Recording APIs
-### Start recording (blocking, max 15s cap)
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/video/start" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"durationSec":6}'
-\`\`\`
+## tabs/close — Close a tab
+POST ${mcpBase}/tabs/close?token=${token}
+  tabId  string  required  tab ID from tablist
+Returns: ok (boolean)
 
-### List recorded videos
-\`\`\`bash
-curl -s "${fullMcpBaseUrl.value}/video/list" \\
-  -H "Authorization: Bearer ${token}"
-\`\`\`
+## dev/html — Page HTML source
+GET ${mcpBase}/dev/html?token=${token}
+Returns: plain-text HTML (document.documentElement.outerHTML)
 
-### Download MP4 by resourceUrl from video/list
-\`\`\`bash
-curl -L "<resourceUrl-from-video-list>" \\
-  -o recording.mp4
-\`\`\`
+## dev/console — Browser console log
+GET ${mcpBase}/dev/console?token=${token}
+Returns: entries (array of {category, type, text, stackTrace, timestamp})
 
-### MCP JSON-RPC examples
-\`\`\`json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_video_recording","arguments":{"durationSec":6}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_recorded_videos","arguments":{}}}
-\`\`\`
+## devtools — Unified DevTools diagnostics
+GET ${mcpBase}/devtools?token=${token}
+POST ${mcpBase}/devtools?token=${token}
+  action        string  optional  snapshot | console.clear | network.clear | debugger.pause | debugger.resume | debugger.stepInto | debugger.stepOver | debugger.stepOut | debugger.evaluate
+  consoleLimit  number  optional  number of console entries in snapshot
+  networkLimit  number  optional  number of network entries in snapshot
+  expression    string  optional  JS expression for debugger.evaluate while paused
+  callFrameId   string  optional  paused frame id for debugger.evaluate
+Returns: page, console, network, debugger, evaluation
 
-## Clipboard APIs
-### Paste large content
-\`\`\`bash
-curl -s -X POST "${fullMcpBaseUrl.value}/paste" \\
-  -H "Authorization: Bearer ${token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"text":"large text ..."}'
-\`\`\`
+## dev/eval — Execute JavaScript
+POST ${mcpBase}/dev/eval?token=${token}
+  script  string  required  JS expression to evaluate
+Returns: result (any)
 
-### View browser clipboard
-\`\`\`bash
-curl -s "${fullMcpBaseUrl.value}/clipboard/view" \\
-  -H "Authorization: Bearer ${token}"
-\`\`\`
+## clipboard/view — Read clipboard
+GET ${mcpBase}/clipboard/view?token=${token}
+Returns: text (string)
 
-## Declared Tools
-${formatToolsForMarkdown()}
+## video/start — Record viewport (blocking, max 15s)
+POST ${mcpBase}/video/start?token=${token}
+  durationSec  number  required  duration in seconds (max: 15)
+Returns: resourceUrl (string, MP4 as application/octet-stream), fileId (string)
+Download: curl -L "<resourceUrl>" -o recording.mp4
+
+## video/list — List recordings
+GET ${mcpBase}/video/list?token=${token}
+Returns: videos (array of {fileId, filename, createdAt, resourceUrl})
+  resourceUrl downloads as application/octet-stream
+
+## downloads — List browser downloads
+GET ${mcpBase}/downloads?token=${token}
+Returns: downloads (array of {filename, size, mimeType, resourceUrl})
+  resourceUrl downloads as application/octet-stream
 `
 }
 
@@ -420,13 +391,15 @@ function downloadGuide() {
 onMounted(async () => {
   applyRoutePreset()
   try {
-    const resp = await api.get('/api/browser-tools/catalog')
-    tools.value = resp.data.tools || []
-    routePrefix.value = resp.data.routePrefix || '/api/mcp'
-    await loadBrowserAccessToken()
-    if (tools.value.length > 0 && !guideMarkdown.value) {
-      generateGuide()
+    const [catalogResp] = await Promise.allSettled([
+      api.get('/api/browser-tools/catalog')
+    ])
+    if (catalogResp.status === 'fulfilled') {
+      tools.value = catalogResp.value.data.tools || []
+      routePrefix.value = catalogResp.value.data.routePrefix || '/api/mcp'
     }
+    await loadBrowserAccessToken()
+    generateGuide()
   } catch (e) {
     console.error('Failed to load tools catalog:', e)
   }
@@ -463,10 +436,6 @@ watch(
 
 h3 {
   margin: 6px 0 8px;
-}
-
-h4 {
-  margin: 12px 0 8px;
 }
 
 table {
@@ -512,13 +481,6 @@ th, td {
   margin-top: 10px;
 }
 
-.actions {
-  display: flex;
-  gap: 8px;
-  margin: 12px 0;
-  flex-wrap: wrap;
-}
-
 .help-type-switch {
   display: flex;
   gap: 8px;
@@ -535,15 +497,28 @@ th, td {
   font-size: 12px;
 }
 
-.guide-preview {
-  white-space: pre-wrap;
-  background: #0d1117;
-  color: #e6edf3;
+.skills-url-box {
+  margin-top: 14px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
   border-radius: 8px;
-  padding: 12px;
-  max-height: 420px;
-  overflow: auto;
+  background: #eef6ff;
+  border: 1px solid #b3d8ff;
+  font-size: 13px;
+}
+
+.skills-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.skills-url-link {
+  font-family: monospace;
   font-size: 12px;
-  line-height: 1.45;
+  color: #0969da;
+  word-break: break-all;
 }
 </style>

@@ -2,53 +2,69 @@
 
 ## Purpose
 
-This capability describes how AI should interact with Shared Browser MCP without transferring huge base64 payloads.
+This document helps AI agents interact with Shared Browser API without unnecessary data transfer.
+
+## Read Full API Skills
+
+Full API reference with copyable URLs (including token) is available at:
+
+```
+GET /api/ai/help/read-skills?token=<aiToken>
+```
+
+The response is plain text containing all endpoint URLs pre-filled with the token, parameter specs, and curl examples.
 
 ## Core Rules
 
-- Prefer MCP tool calls and API JSON endpoints first.
-- For large binary data, use returned `resourceUrl` + `resourceToken`.
-- Fetch binary via `GET /api/mcp/:browserId/dl_res?...` with `curl`.
-- Do not request giant `contentBase64` blobs for screenshot/video/downloads.
+- Use `?token=<token>` on every API call (or `Authorization: Bearer <token>`).
+- Prefer selector-based pointer/keyboard operations; fall back to coordinates only when needed.
+- For large binary data (screenshots, videos, downloads), use the returned `resourceUrl` — do NOT request raw base64.
+- Prefer `devtools` over the old console endpoint when diagnosing failures; it exposes console/runtime/network/debugger state in one place.
+- Fetch binary resources via: `curl -L "<resourceUrl>" -o output.bin`
 
-## New Data Transfer Pattern
+## Data Transfer Pattern
 
-Tools now return:
+Tools return a `resourceUrl` (short-lived, ~15 min) for binary content:
 
-- `resourceUrl`: direct GET URL for binary fetch
-- `resourceToken`: short-lived token embedded in URL query
+- `screenshot` → `resourceUrl` for JPEG/PNG image (application/octet-stream)
+- `video/list` → each item has `resourceUrl` for MP4 (application/octet-stream)
+- `downloads` → each completed file has `resourceUrl` (application/octet-stream)
 
-Use:
+## Key API Endpoints
 
-```bash
-curl -L "<resourceUrl>" -o out.bin
-```
-
-## Tool Notes
-
-- `screenshot`:
-  - returns metadata + `resourceUrl`
-  - server keeps only latest 10 screenshots per browser
-- `list_recorded_videos`:
-  - each item includes `resourceUrl`
-- `downloads`:
-  - returns `{ files, active }`, and both entries include `resourceUrl`
-- `paste`:
-  - text/html only
-- `pasteFiles`:
-  - use multipart upload for files
+| Action           | Method | Path                                    |
+|------------------|--------|-----------------------------------------|
+| Read skills      | GET    | /api/ai/help/read-skills?token=TOKEN    |
+| List browsers    | GET    | /api/browsers?token=TOKEN               |
+| Screenshot       | POST   | /api/mcp/:bid/screenshot                |
+| Pointer          | POST   | /api/mcp/:bid/pointer                   |
+| Keyboard         | POST   | /api/mcp/:bid/keyboard                  |
+| Paste text       | POST   | /api/mcp/:bid/paste                     |
+| Paste files      | POST   | /api/mcp/:bid/pasteFiles (multipart)    |
+| View clipboard   | GET    | /api/mcp/:bid/clipboard/view            |
+| Tab list         | GET    | /api/mcp/:bid/tablist                   |
+| Navigate         | POST   | /api/mcp/:bid/navigate                  |
+| Tab select/new/close | POST | /api/mcp/:bid/tabs/{select,new,close} |
+| Record video     | POST   | /api/mcp/:bid/video/start               |
+| List videos      | GET    | /api/mcp/:bid/video/list                |
+| Downloads        | GET    | /api/mcp/:bid/downloads                 |
+| HTML source      | GET    | /api/mcp/:bid/dev/html                  |
+| Console log      | GET    | /api/mcp/:bid/dev/console               |
+| DevTools         | GET/POST | /api/mcp/:bid/devtools                |
+| Eval JS          | POST   | /api/mcp/:bid/dev/eval                  |
 
 ## pasteFiles Example
 
 ```bash
-curl -X POST "http://<host>:3000/api/mcp/<browserId>/pasteFiles" \
-  -H "Authorization: Bearer <token>" \
-  -F "selector=#target" \
-  -F "files=@C:/tmp/a.png" \
-  -F "files=@C:/tmp/b.txt"
+curl -X POST "http://<host>:<port>/api/mcp/<bid>/pasteFiles?token=<token>" \
+  -F "selector=#upload-input" \
+  -F "files=@/tmp/file.pdf"
 ```
 
-## Compatibility
+## Reliable Action Loop
 
-- Existing MCP JSON-RPC `tools/call` remains available.
-- WebAPI and MCP still share the same execution path.
+1. `screenshot` — capture current state
+2. `devtools` or `dev/html`/`dev/eval` — inspect errors, network failures, selectors, or paused call frames
+3. Perform one action (`pointer` or `keyboard`)
+4. `screenshot` + `dev/eval` — verify result
+5. If failed: retry with adjusted selector or coordinates
